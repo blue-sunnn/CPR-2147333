@@ -1,0 +1,11 @@
+# Kept on my computer only
+/lecture/
+/project-python/
+/report/
+/project/CPR-Project.pdf
+
+# macOS
+.DS_Store
+
+# Compiled program from `go build`
+/project/cpr
