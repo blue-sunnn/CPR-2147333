@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"fmt"
+	"math/rand/v2"
 	"slices"
 	"strings"
 )
@@ -14,6 +15,9 @@ import (
 //  1. decide:  list what each robot wants to do (MoveAction / PickupAction)
 //  2. check:   CheckMoveActions / CheckPickupActions sort them into legal and illegal
 //  3. apply:   ApplyLegalMoves / ApplyLegalPickups carry out only the legal ones
+//
+// Tick runs all three steps for every robot at once (one iteration). MoveStep
+// and PickupStep run them for one kind of action only; the keyboard uses those.
 
 // N is the width and height of the grid.
 const N = 10
@@ -171,6 +175,26 @@ func ValidatePlacement(m *Map, robots []*Robot, targets []*Target) error {
 	return nil
 }
 
+// RandomPlacement puts the given number of robots (IDs 1, 2, ...) and targets
+// (IDs 0, 1, ...) on distinct random cells of an n x n grid. The robots face
+// random directions. The caller checks that everything fits.
+func RandomPlacement(n, robots, targets int) ([]*Robot, []*Target) {
+	cells := rand.Perm(n * n)
+	facings := []string{"N", "E", "S", "W"}
+
+	var rs []*Robot
+	for i := range robots {
+		c := cells[i]
+		rs = append(rs, &Robot{id: i + 1, row: c / n, col: c % n, facing: facings[rand.IntN(len(facings))]})
+	}
+	var ts []*Target
+	for i := range targets {
+		c := cells[robots+i]
+		ts = append(ts, &Target{id: i, row: c / n, col: c % n})
+	}
+	return rs, ts
+}
+
 // ---------------------------------------------------------------- ticks
 
 // MoveStep runs one MOVE tick for the given robots: every robot decides to
@@ -208,6 +232,57 @@ func PickupStep(robots []*Robot, targets []*Target, name string) (string, []*Tar
 	verdict := "[" + name + "] " + describePickups(report)
 	fmt.Println(verdict)
 
+	return verdict, ApplyLegalPickups(targets, report)
+}
+
+// Tick runs one iteration: every robot senses and decides an action, the moves
+// and pickups are checked, and only the legal ones happen. The iteration number
+// is m.turn. It returns a one-line verdict and the targets that remain.
+func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
+	m.turn++
+
+	// Everyone senses and decides before anything changes, so no robot
+	// sees the result of another robot's action this iteration.
+	chosen := make([]string, len(robots))
+	for i, r := range robots {
+		chosen[i] = r.Decide(r.Sense(robots, targets))
+	}
+
+	var moves []MoveAction
+	var pickups []PickupAction
+	counts := map[string]int{}
+	for i, r := range robots {
+		counts[chosen[i]]++
+		switch chosen[i] {
+		case actionMove:
+			row, col := r.PreMove()
+			moves = append(moves, MoveAction{r.id, row, col})
+		case actionLeft: // turning is always legal, so it needs no check
+			r.TurnLeft()
+		case actionRight:
+			r.TurnRight()
+		case actionPickup:
+			pickups = append(pickups, PickupAction{r.id, r.row, r.col})
+		}
+	}
+
+	legalMoves, outOfBounds := CheckMoveActions(m, moves)
+	report := CheckPickupActions(targets, pickups)
+	ApplyLegalMoves(robots, legalMoves, m.turn)
+
+	var parts []string
+	for _, a := range allActions {
+		if counts[a] > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d", a, counts[a]))
+		}
+	}
+	verdict := fmt.Sprintf("[tick %d] %s", m.turn, strings.Join(parts, ", "))
+	if len(outOfBounds) > 0 {
+		verdict += "; " + describeMoves(outOfBounds)
+	}
+	if len(pickups) > 0 {
+		verdict += "; " + describePickups(report)
+	}
 	return verdict, ApplyLegalPickups(targets, report)
 }
 
