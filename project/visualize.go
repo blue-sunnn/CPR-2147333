@@ -2,9 +2,11 @@ package main
 
 import (
 	"cmp"
+	"fmt"
 	"image/color"
 	"math"
 	"slices"
+	"strconv"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -21,6 +23,10 @@ import (
 const (
 	easing      = 0.2 // fraction of the remaining distance a view covers each frame
 	stackOffset = 0.2 // gap, in cells, between robots that share a cell
+
+	tickFrames = 30 // frames between ticks while running (60 frames per second)
+
+	logMaxLines = 200 // log lines kept; older ones are dropped
 )
 
 // view is how one robot or target is currently drawn.
@@ -46,7 +52,12 @@ type Game struct {
 	m       *Map
 	robots  []*Robot
 	targets []*Target
-	title   string // status line shown above the board
+	log     []string // one line per action, oldest first; the newest lines are drawn below the board
+
+	panel      *Panel
+	iterations int  // how many ticks a run lasts, from the panel
+	running    bool // true while the simulation ticks by itself
+	wait       int  // frames since the last tick
 
 	rv    map[*Robot]*view
 	tv    map[*Target]*view
@@ -55,48 +66,104 @@ type Game struct {
 	board *ebiten.Image // the empty board, drawn once and reused every frame
 }
 
-// NewGame checks that the starting layout is legal and builds the window state.
-func NewGame(size int, robots []*Robot, targets []*Target) (*Game, error) {
-	m := &Map{size: size}
-	if err := ValidatePlacement(m, robots, targets); err != nil {
-		return nil, err
-	}
+// NewGame returns an empty board; the panel's Apply button fills it.
+func NewGame() *Game {
 	return &Game{
-		m:       m,
-		robots:  robots,
-		targets: targets,
-		rv:      map[*Robot]*view{},
-		tv:      map[*Target]*view{},
-	}, nil
+		m:     &Map{size: N},
+		rv:    map[*Robot]*view{},
+		tv:    map[*Target]*view{},
+		panel: NewPanel(),
+	}
 }
 
+// addLog adds one line to the log shown under the board.
+func (g *Game) addLog(line string) {
+	g.log = append(g.log, line)
+	if len(g.log) > logMaxLines {
+		g.log = g.log[len(g.log)-logMaxLines:]
+	}
+}
+
+// apply starts over with the robot, target and iteration counts from the panel,
+// placing everything at random cells.
+func (g *Game) apply() {
+	if slices.Contains(g.panel.values[:], "") {
+		g.addLog("[panel] fill in robots, targets and iterations first")
+		return
+	}
+	robots, targets, iterations := g.panel.Value(fieldRobots), g.panel.Value(fieldTargets), g.panel.Value(fieldIterations)
+	if robots+targets > N*N {
+		g.addLog(fmt.Sprintf("[panel] cannot fit %d robots and %d targets on a %dx%d grid", robots, targets, N, N))
+		return
+	}
+
+	g.robots, g.targets = RandomPlacement(N, robots, targets)
+	g.iterations = iterations
+	g.running = iterations > 0
+	g.wait = 0
+	g.m.turn = 0
+	clear(g.rv)
+	clear(g.tv)
+	g.order = nil
+	g.addLog(fmt.Sprintf("[panel] new run: %d robots, %d targets, %d iterations", robots, targets, iterations))
+}
+
+// Layout, Update and Draw (in draw.go) are what Ebitengine calls to run the window.
 func (g *Game) Layout(outsideWidth, outsideHeight int) (int, int) {
 	return ScreenWidth, ScreenHeight
 }
 
+// Update runs 60 times a second: it reads the panel, advances the simulation,
+// then moves the animated views one step.
 func (g *Game) Update() error {
-	g.handleKeys()
+	if g.panel.Update() {
+		g.apply()
+	}
+	if g.running {
+		g.runTick()
+	} else {
+		g.handleKeys()
+	}
 	g.animate()
 	return nil
+}
+
+// runTick runs one tick every tickFrames frames until the iterations are used up.
+func (g *Game) runTick() {
+	g.wait++
+	if g.wait < tickFrames {
+		return
+	}
+	g.wait = 0
+
+	var verdict string
+	verdict, g.targets = Tick(g.m, g.robots, g.targets)
+	g.addLog(verdict)
+	if g.m.turn >= g.iterations {
+		g.running = false
+		g.addLog(fmt.Sprintf("[sim] finished after %d iterations", g.iterations))
+	}
 }
 
 // handleKeys is a manual stepper: each key press runs one tick for every robot.
 func (g *Game) handleKeys() {
 	switch {
 	case inpututil.IsKeyJustPressed(ebiten.KeySpace):
-		g.title = MoveStep(g.m, g.robots, "manual")
+		g.addLog(MoveStep(g.m, g.robots, "manual"))
 	case inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft):
 		for _, r := range g.robots {
 			r.TurnLeft()
 		}
-		g.title = "Turn left"
+		g.addLog("[manual] TURN LEFT")
 	case inpututil.IsKeyJustPressed(ebiten.KeyArrowRight):
 		for _, r := range g.robots {
 			r.TurnRight()
 		}
-		g.title = "Turn right"
+		g.addLog("[manual] TURN RIGHT")
 	case inpututil.IsKeyJustPressed(ebiten.KeyP):
-		g.title, g.targets = PickupStep(g.robots, g.targets, "manual")
+		var verdict string
+		verdict, g.targets = PickupStep(g.robots, g.targets, "manual")
+		g.addLog(verdict)
 	}
 }
 
@@ -106,6 +173,7 @@ func (g *Game) animate() {
 	g.animateTargets()
 }
 
+// animateRobots glides each robot view to its cell, direction and stack position.
 func (g *Game) animateRobots() {
 	for i, r := range g.robots {
 		if g.rv[r] == nil {
@@ -136,6 +204,7 @@ func (g *Game) animateRobots() {
 	}
 }
 
+// animateTargets grows new targets in and shrinks picked-up ones away.
 func (g *Game) animateTargets() {
 	// A target that is no longer in the simulation has been picked up.
 	for _, v := range g.tv {
@@ -203,4 +272,118 @@ func turnToward(from, to float64) float64 {
 		turn += 2 * math.Pi
 	}
 	return turn
+}
+
+// ------------------------------------------------------- settings panel
+
+// The panel to the right of the board: three number fields (robots, targets,
+// iterations) and an Apply button. Click a field to type in it; Tab moves to
+// the next field and Enter applies.
+
+const (
+	fieldRobots = iota
+	fieldTargets
+	fieldIterations
+	fieldCount
+)
+
+const (
+	panelPad     = 16
+	panelHead    = 44 // room for the heading at the top of the panel
+	fieldLabelH  = 24 // room for a field's label above its box
+	fieldHeight  = 36
+	fieldSpacing = 16 // between one field box and the next label
+	buttonHeight = 40
+	maxDigits    = 3
+
+	backspaceDelay  = 30 // frames the key is held before it starts repeating
+	backspaceRepeat = 3  // then it deletes once every this many frames
+)
+
+var fieldLabels = [fieldCount]string{"Robots", "Targets", "Iterations"}
+
+var (
+	fieldColor  = color.RGBA{0xfa, 0xf8, 0xef, 0xff}
+	buttonColor = color.RGBA{0xf6, 0x7c, 0x5f, 0xff}
+)
+
+// Panel is the settings panel: the three number fields as typed text.
+type Panel struct {
+	values [fieldCount]string
+	focus  int // index of the field being typed in, or -1
+	frames int // counts frames, to blink the caret
+}
+
+// NewPanel returns a panel with empty fields and nothing focused.
+func NewPanel() *Panel {
+	return &Panel{focus: -1}
+}
+
+// Value is the number typed in field i; an empty field counts as 0.
+func (p *Panel) Value(i int) int {
+	n, _ := strconv.Atoi(p.values[i])
+	return n
+}
+
+// rect is a rectangle in window pixels.
+type rect struct{ x, y, w, h float32 }
+
+func (r rect) contains(px, py int) bool {
+	return float32(px) >= r.x && float32(px) < r.x+r.w && float32(py) >= r.y && float32(py) < r.y+r.h
+}
+
+func panelRect() rect {
+	return rect{margin + boardSize + margin, topBar, panelWidth, boardSize}
+}
+
+func fieldRect(i int) rect {
+	pr := panelRect()
+	y := pr.y + panelHead + float32(i)*(fieldLabelH+fieldHeight+fieldSpacing) + fieldLabelH
+	return rect{pr.x + panelPad, y, pr.w - 2*panelPad, fieldHeight}
+}
+
+func buttonRect() rect {
+	last := fieldRect(fieldCount - 1)
+	return rect{last.x, last.y + last.h + 2*fieldSpacing, last.w, buttonHeight}
+}
+
+// Update handles the mouse and keyboard. It reports true when the user asks
+// to apply the settings.
+func (p *Panel) Update() (apply bool) {
+	p.frames++
+
+	if inpututil.IsMouseButtonJustPressed(ebiten.MouseButtonLeft) {
+		mx, my := ebiten.CursorPosition()
+		p.focus = -1
+		for i := range p.values {
+			if fieldRect(i).contains(mx, my) {
+				p.focus = i
+			}
+		}
+		if buttonRect().contains(mx, my) {
+			apply = true
+		}
+	}
+
+	if p.focus < 0 {
+		return apply
+	}
+
+	v := &p.values[p.focus]
+	for _, c := range ebiten.AppendInputChars(nil) {
+		if c >= '0' && c <= '9' && len(*v) < maxDigits {
+			*v += string(c)
+		}
+	}
+	held := inpututil.KeyPressDuration(ebiten.KeyBackspace)
+	if len(*v) > 0 && (held == 1 || held > backspaceDelay && held%backspaceRepeat == 0) {
+		*v = (*v)[:len(*v)-1]
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyTab) {
+		p.focus = (p.focus + 1) % fieldCount
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) {
+		apply = true
+	}
+	return apply
 }

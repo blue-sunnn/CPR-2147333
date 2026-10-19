@@ -9,6 +9,7 @@ import (
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/text/v2"
 	"github.com/hajimehoshi/ebiten/v2/vector"
+	"golang.org/x/image/font/gofont/gobold"
 	"golang.org/x/image/font/gofont/goregular"
 )
 
@@ -16,14 +17,15 @@ import (
 
 // Window layout, in pixels.
 const (
-	cellSize     = 52 // one square of the grid
-	gap          = 4  // space between squares, and around the edge of the board
-	margin       = 20 // space left and right of the board
-	topBar       = 64 // room above the board for the status line
-	bottomBar    = 44 // room below the board for the key hints
+	cellSize     = 52  // one square of the grid
+	gap          = 4   // space between squares, and around the edge of the board
+	margin       = 20  // space left and right of the board
+	topBar       = 64  // room above the board for the heading
+	logBar       = 156 // room below the board for the log
+	panelWidth   = 200 // the settings panel to the right of the board
 	boardSize    = N*cellSize + (N+1)*gap
-	ScreenWidth  = boardSize + 2*margin
-	ScreenHeight = topBar + boardSize + bottomBar
+	ScreenWidth  = margin + boardSize + margin + panelWidth + margin
+	ScreenHeight = topBar + boardSize + logBar
 )
 
 // Sizes of the things drawn on the board.
@@ -43,18 +45,23 @@ const (
 	starOutline    = 5    // pixels
 
 	titleSize = 18
-	hintSize  = 13
+	logSize   = 13
+
+	logLines  = 5  // how many log lines fit in the log box
+	logLineH  = 20 // pixels per log line
+	logBoxGap = 12 // space between the board and the log box
+	logPad    = 12 // space between the log box edge and its text
 )
 
 var (
-	bgColor     = color.RGBA{0xfa, 0xf8, 0xef, 0xff}
-	frameColor  = color.RGBA{0xbb, 0xad, 0xa0, 0xff}
-	emptyColor  = color.RGBA{0xcd, 0xc1, 0xb4, 0xff}
-	textColor   = color.RGBA{0x77, 0x6e, 0x65, 0xff}
-	hintColor   = color.RGBA{0xa3, 0x9a, 0x8d, 0xff}
-	starColor   = color.RGBA{0xed, 0xc2, 0x2e, 0xff}
-	starEdge    = color.RGBA{0xd9, 0xa4, 0x1c, 0xff}
-	shadowColor = color.NRGBA{0, 0, 0, 45}
+	bgColor      = color.RGBA{0xfa, 0xf8, 0xef, 0xff}
+	frameColor   = color.RGBA{0xbb, 0xad, 0xa0, 0xff}
+	emptyColor   = color.RGBA{0xcd, 0xc1, 0xb4, 0xff}
+	textColor    = color.RGBA{0x77, 0x6e, 0x65, 0xff}
+	dimTextColor = color.RGBA{0xa3, 0x9a, 0x8d, 0xff}
+	starColor    = color.RGBA{0xed, 0xc2, 0x2e, 0xff}
+	starEdge     = color.RGBA{0xd9, 0xa4, 0x1c, 0xff}
+	shadowColor  = color.NRGBA{0, 0, 0, 45}
 
 	// Robot i gets robotColors[i % len(robotColors)], by position in the robot list.
 	robotColors = []color.RGBA{
@@ -64,7 +71,7 @@ var (
 		{0xa4, 0x7b, 0xc0, 0xff},
 	}
 
-	fontSource *text.GoTextFaceSource
+	fontSource, boldSource *text.GoTextFaceSource
 )
 
 func init() {
@@ -73,15 +80,22 @@ func init() {
 		log.Fatal(err)
 	}
 	fontSource = source
+
+	source, err = text.NewGoTextFaceSource(bytes.NewReader(gobold.TTF))
+	if err != nil {
+		log.Fatal(err)
+	}
+	boldSource = source
 }
 
+// Draw paints the whole window; Ebitengine calls it every frame.
 func (g *Game) Draw(screen *ebiten.Image) {
 	screen.Fill(bgColor)
-	drawText(screen, g.title, ScreenWidth/2, topBar/2, titleSize, textColor)
-	drawText(screen, "Space  move      Left / Right  turn      P  pick up",
-		ScreenWidth/2, ScreenHeight-bottomBar/2, hintSize, hintColor)
+	drawAligned(screen, boldSource, "simulation", ScreenWidth/2, topBar/2, titleSize, textColor, text.AlignCenter)
 
 	g.drawBoard(screen)
+	g.drawLog(screen)
+	g.panel.Draw(screen)
 
 	for _, v := range g.tv {
 		drawStar(screen, v)
@@ -110,6 +124,28 @@ func (g *Game) drawBoard(screen *ebiten.Image) {
 	op := &ebiten.DrawImageOptions{}
 	op.GeoM.Translate(margin, topBar)
 	screen.DrawImage(g.board, op)
+}
+
+// drawLog draws the most recent log lines in a box under the board, newest at
+// the bottom. Older lines are lighter.
+func (g *Game) drawLog(screen *ebiten.Image) {
+	x, y := float32(margin), float32(topBar+boardSize+logBoxGap)
+	w, h := float32(ScreenWidth-2*margin), float32(logBar-logBoxGap-margin)
+	fillRoundRect(screen, x, y, w, h, boardRadius, frameColor)
+	fillRoundRect(screen, x+gap, y+gap, w-2*gap, h-2*gap, cellRadius, emptyColor)
+
+	lines := g.log
+	if len(lines) > logLines {
+		lines = lines[len(lines)-logLines:]
+	}
+	for i, line := range lines {
+		clr := dimTextColor
+		if i == len(lines)-1 {
+			clr = textColor
+		}
+		line = fitText(line, logSize, float64(w)-2*logPad)
+		drawTextLeft(screen, line, float64(x)+logPad, float64(y)+logPad+(float64(i)+0.5)*logLineH, logSize, clr)
+	}
 }
 
 // screenX and screenY convert a position in cell units (0 is the center of the
@@ -210,10 +246,62 @@ func fillRoundRect(dst *ebiten.Image, x, y, w, h, radius float32, clr color.Colo
 
 // drawText draws centered text; (x, y) is the middle of the text.
 func drawText(dst *ebiten.Image, s string, x, y, size float64, clr color.Color) {
+	drawAligned(dst, fontSource, s, x, y, size, clr, text.AlignCenter)
+}
+
+// drawTextLeft draws text that starts at x; y is the vertical middle of the text.
+func drawTextLeft(dst *ebiten.Image, s string, x, y, size float64, clr color.Color) {
+	drawAligned(dst, fontSource, s, x, y, size, clr, text.AlignStart)
+}
+
+func drawAligned(dst *ebiten.Image, source *text.GoTextFaceSource, s string, x, y, size float64, clr color.Color, align text.Align) {
 	op := &text.DrawOptions{}
 	op.GeoM.Translate(x, y)
 	op.ColorScale.ScaleWithColor(clr)
-	op.PrimaryAlign = text.AlignCenter
+	op.PrimaryAlign = align
 	op.SecondaryAlign = text.AlignCenter
-	text.Draw(dst, s, &text.GoTextFace{Source: fontSource, Size: size}, op)
+	text.Draw(dst, s, &text.GoTextFace{Source: source, Size: size}, op)
+}
+
+// fitText shortens s with an ellipsis until it is at most maxWidth pixels wide.
+func fitText(s string, size, maxWidth float64) string {
+	face := &text.GoTextFace{Source: fontSource, Size: size}
+	if w, _ := text.Measure(s, face, 0); w <= maxWidth {
+		return s
+	}
+	runes := []rune(s)
+	for len(runes) > 0 {
+		runes = runes[:len(runes)-1]
+		if w, _ := text.Measure(string(runes)+"…", face, 0); w <= maxWidth {
+			break
+		}
+	}
+	return string(runes) + "…"
+}
+
+// Draw paints the panel: heading, the three fields, and the Apply button.
+func (p *Panel) Draw(screen *ebiten.Image) {
+	pr := panelRect()
+	fillRoundRect(screen, pr.x, pr.y, pr.w, pr.h, boardRadius, frameColor)
+	drawText(screen, "Settings", float64(pr.x+pr.w/2), float64(pr.y+panelHead/2+4), titleSize, fieldColor)
+
+	for i, label := range fieldLabels {
+		fr := fieldRect(i)
+		drawTextLeft(screen, label, float64(fr.x), float64(fr.y-fieldLabelH/2), labelSize, fieldColor)
+
+		if p.focus == i {
+			fillRoundRect(screen, fr.x-2, fr.y-2, fr.w+4, fr.h+4, cellRadius+2, starColor)
+		}
+		fillRoundRect(screen, fr.x, fr.y, fr.w, fr.h, cellRadius, fieldColor)
+
+		s := p.values[i]
+		if p.focus == i && (p.frames/30)%2 == 0 {
+			s += "|"
+		}
+		drawTextLeft(screen, s, float64(fr.x+10), float64(fr.y+fr.h/2), titleSize, textColor)
+	}
+
+	br := buttonRect()
+	fillRoundRect(screen, br.x, br.y, br.w, br.h, cellRadius, buttonColor)
+	drawText(screen, "Apply", float64(br.x+br.w/2), float64(br.y+br.h/2), titleSize, color.White)
 }
