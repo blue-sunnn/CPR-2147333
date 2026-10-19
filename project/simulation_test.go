@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"slices"
+	"testing"
+)
 
 func TestApplyLegalMoves(t *testing.T) {
 	r1 := &Robot{id: 1, row: 1, col: 3, facing: "N"}
@@ -106,5 +109,55 @@ func TestDrawOrder(t *testing.T) {
 		if got[i] != want[i] {
 			t.Fatalf("order[%d] = r%d, want r%d", i, got[i].id, want[i].id)
 		}
+	}
+}
+
+func TestRandomPlacement(t *testing.T) {
+	// A completely full grid is the hardest case: every cell gets used once.
+	robots, targets := RandomPlacement(10, 60, 40)
+	if len(robots) != 60 || len(targets) != 40 {
+		t.Fatalf("got %d robots and %d targets, want 60 and 40", len(robots), len(targets))
+	}
+	if err := ValidatePlacement(&Map{size: 10}, robots, targets); err != nil {
+		t.Errorf("random placement is not a legal layout: %v", err)
+	}
+}
+
+func TestTick(t *testing.T) {
+	m := &Map{size: 10}
+	robots, targets := RandomPlacement(10, 5, 3)
+	for i := 1; i <= 200; i++ {
+		before := len(targets)
+		_, targets = Tick(m, robots, targets)
+		if m.turn != i {
+			t.Fatalf("turn = %d after %d ticks", m.turn, i)
+		}
+		if len(targets) > before {
+			t.Fatalf("targets grew from %d to %d", before, len(targets))
+		}
+		for _, r := range robots {
+			if !m.IsInBounds(r.row, r.col) {
+				t.Fatalf("%s left the grid at (%d, %d)", r.label(), r.row, r.col)
+			}
+		}
+	}
+}
+
+func TestSense(t *testing.T) {
+	r1 := &Robot{id: 1, row: 5, col: 5, facing: "E"}
+	ahead := &Robot{id: 2, row: 5, col: 6, facing: "N"}
+	here := &Robot{id: 3, row: 5, col: 5, facing: "N"}
+	far := &Robot{id: 4, row: 0, col: 0, facing: "N"}
+	robots := []*Robot{r1, ahead, here, far}
+	targets := []*Target{{id: 0, row: 5, col: 6}}
+
+	got := r1.Sense(robots, targets)
+	if !got.targetAhead || !slices.Equal(got.robotsAhead, []int{2}) || !slices.Equal(got.robotsHere, []int{3}) {
+		t.Errorf("r1 sensed %+v, want target ahead, robot 2 ahead, robot 3 here", got)
+	}
+
+	// Facing the edge: nothing is in front, and a target behind is not sensed.
+	if got := far.Sense(robots, targets); got.targetAhead || len(got.robotsAhead) != 0 || len(got.robotsHere) != 0 {
+		t.Errorf("far sensed %+v, want nothing", got)
 	}
 }
