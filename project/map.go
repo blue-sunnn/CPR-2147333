@@ -4,7 +4,7 @@ package main
 // 0..size-1, and row 0 is the top of the screen.
 type Map struct {
 	size int
-	turn int // number of MOVE ticks so far; robots record it as their arrival time
+	turn int // iterations so far; robots record it as their arrival time
 }
 
 func (m *Map) IsInBounds(row, col int) bool {
