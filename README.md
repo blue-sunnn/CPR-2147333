@@ -102,6 +102,31 @@ cd project
 go test ./...
 ```
 
+## Using the window
+
+The board starts empty. Type a number in each of the three fields on the right
+(all three are required), then click **Apply** or press Enter:
+
+| Field | Meaning |
+|---|---|
+| Robots | How many robots to place, each at a random cell facing a random direction. |
+| Targets | How many targets to place at random cells. |
+| Iterations | How many ticks the run lasts. |
+
+Click a field to type in it, Tab moves to the next one, Backspace deletes.
+Robots and targets together cannot be more than the 100 cells of the grid.
+
+After Apply, the simulation ticks on its own twice a second until it reaches
+the iteration count. The **log** under the board shows one line per tick (what
+the robots did and any illegal action that was blocked), newest line at the
+bottom.
+
+When no run is going, the keyboard steps every robot by hand: Space moves,
+Left / Right turn, P picks up.
+
+Right now each robot picks a random action (`Robot.Decide` in `robot.go`), so
+the robots wander. The real behavior is the next thing to write.
+
 ## How the code is organized
 
 All of `project/` is one Go package (`package main`), so files use each other
@@ -109,12 +134,13 @@ without imports.
 
 | File | Job |
 |---|---|
-| `main.go` | The starting layout of robots and targets, and opens the window. |
-| `simulation.go` | The rules. Each tick decides the actions, checks them, and applies only the legal ones. Also checks the starting layout. |
-| `robot.go`, `target.go`, `map.go` | The data types: a robot (position, facing, which turn it arrived), a target, the grid. |
-| `visualize.go` | The window state and the keyboard stepper. The picture glides toward the simulation state a little every frame, so the simulation itself can jump instantly. |
-| `draw.go` | All drawing: the board, robots, stars, text, colors and sizes. |
-| `simulation_test.go` | Tests for the rules. |
+| `main.go` | Opens the window. The board starts empty; Apply in the panel places robots and targets at random. |
+| `simulation.go` | The rules. `Tick` is one iteration: every robot senses and decides, the actions are checked, and only the legal ones are applied. Also checks the starting layout and makes random ones. |
+| `robot.go` | The robot: position, facing, which turn it arrived. `Sense` is what it sees and `Decide` picks its action (random for now, the real rules go here). |
+| `target.go`, `map.go` | The target and the grid. |
+| `visualize.go` | The window state, the log, the settings panel (number fields and Apply) and the keyboard stepper for when no run is going. The picture glides toward the simulation state a little every frame, so the simulation itself can jump instantly. |
+| `draw.go` | All drawing: the board, robots, stars, the log box, text, colors and sizes. |
+| `simulation_test.go` | Tests for the rules, random placement, `Sense` and `Tick`. |
 | `go.mod`, `go.sum` | The Go dependencies and their checksums. |
 
 `simulation.go` does not use the window, so the rules can be tested and reused
