@@ -151,13 +151,83 @@ func TestSense(t *testing.T) {
 	robots := []*Robot{r1, ahead, here, far}
 	targets := []*Target{{id: 0, row: 5, col: 6}}
 
-	got := r1.Sense(robots, targets)
+	m := &Map{size: 10}
+
+	got := r1.Sense(m, robots, targets)
 	if !got.targetAhead || !slices.Equal(got.robotsAhead, []int{2}) || !slices.Equal(got.robotsHere, []int{3}) {
 		t.Errorf("r1 sensed %+v, want target ahead, robot 2 ahead, robot 3 here", got)
 	}
 
 	// Facing the edge: nothing is in front, and a target behind is not sensed.
-	if got := far.Sense(robots, targets); got.targetAhead || len(got.robotsAhead) != 0 || len(got.robotsHere) != 0 {
+	if got := far.Sense(m, robots, targets); got.targetAhead || len(got.robotsAhead) != 0 || len(got.robotsHere) != 0 {
 		t.Errorf("far sensed %+v, want nothing", got)
+	}
+	if got := far.Sense(m, robots, targets); !got.wallAhead {
+		t.Errorf("far sensed %+v, want wall ahead", got)
+	}
+}
+
+// history holds the last four actions, oldest first.
+func TestRobotHistory(t *testing.T) {
+	r := &Robot{id: 1, row: 5, col: 5, facing: "N"}
+
+	// Four forward moves look the same as an empty history; the next turn must
+	// still be recorded as the newest entry.
+	for i := 0; i < 4; i++ {
+		r.Move()
+	}
+	r.TurnLeft()
+	if want := [4]int{Forward, Forward, Forward, Left}; r.history != want {
+		t.Errorf("after 4 moves and a left turn history = %v, want %v", r.history, want)
+	}
+
+	r.TurnRight()
+	r.TurnRight()
+	if want := [4]int{Forward, Left, Right, Right}; r.history != want {
+		t.Errorf("after a further right, right history = %v, want %v", r.history, want)
+	}
+}
+
+// A robot that sees a target in front steps onto it and remembers it is there.
+func TestRobotStepsOntoTarget(t *testing.T) {
+	m := &Map{size: 10}
+	r := &Robot{id: 1, row: 5, col: 4, facing: "E"}
+	targets := []*Target{{id: 0, row: 5, col: 5}}
+
+	Tick(m, []*Robot{r}, targets)
+
+	if r.row != 5 || r.col != 5 {
+		t.Fatalf("robot at (%d, %d), want it on the target at (5, 5)", r.row, r.col)
+	}
+	if !r.onTarget {
+		t.Error("robot stepped onto the target but onTarget is false")
+	}
+}
+
+// A robot on a target waits there, picking up every tick, until a partner joins.
+func TestRobotWaitsOnTargetUntilPartnerArrives(t *testing.T) {
+	m := &Map{size: 10}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
+	targets := []*Target{{id: 0, row: 5, col: 5}}
+
+	for i := 0; i < 5; i++ {
+		_, targets = Tick(m, []*Robot{waiter}, targets)
+	}
+	if waiter.row != 5 || waiter.col != 5 || !waiter.onTarget || len(targets) != 1 {
+		t.Fatalf("lone waiter moved or left: at (%d, %d), onTarget=%v, %d targets left",
+			waiter.row, waiter.col, waiter.onTarget, len(targets))
+	}
+
+	// The partner steps onto the target; next tick both pick up together.
+	partner := &Robot{id: 2, row: 5, col: 4, facing: "E"}
+	robots := []*Robot{waiter, partner}
+	_, targets = Tick(m, robots, targets)
+	_, targets = Tick(m, robots, targets)
+
+	if len(targets) != 0 {
+		t.Errorf("%d targets left, want the pair to have picked it up", len(targets))
+	}
+	if waiter.onTarget || partner.onTarget {
+		t.Errorf("robots still waiting after the pickup: waiter=%v partner=%v", waiter.onTarget, partner.onTarget)
 	}
 }
