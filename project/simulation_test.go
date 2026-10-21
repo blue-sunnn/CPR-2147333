@@ -1,7 +1,9 @@
 package main
 
 import (
+	"math/rand/v2"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -204,30 +206,257 @@ func TestRobotStepsOntoTarget(t *testing.T) {
 	}
 }
 
-// A robot on a target waits there, picking up every tick, until a partner joins.
-func TestRobotWaitsOnTargetUntilPartnerArrives(t *testing.T) {
+// A lone robot on a target keeps waiting; it never picks up on its own.
+func TestLoneWaiterKeepsWaiting(t *testing.T) {
 	m := &Map{size: 10}
 	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
 	targets := []*Target{{id: 0, row: 5, col: 5}}
 
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 30; i++ {
 		_, targets = Tick(m, []*Robot{waiter}, targets)
 	}
 	if waiter.row != 5 || waiter.col != 5 || !waiter.onTarget || len(targets) != 1 {
 		t.Fatalf("lone waiter moved or left: at (%d, %d), onTarget=%v, %d targets left",
 			waiter.row, waiter.col, waiter.onTarget, len(targets))
 	}
+}
 
-	// The partner steps onto the target; next tick both pick up together.
-	partner := &Robot{id: 2, row: 5, col: 4, facing: "E"}
-	robots := []*Robot{waiter, partner}
-	_, targets = Tick(m, robots, targets)
-	_, targets = Tick(m, robots, targets)
+// illegal reports whether a verdict mentions one of the illegal pickups.
+func illegal(verdict string) bool {
+	return strings.Contains(verdict, "NO_TARGET") ||
+		strings.Contains(verdict, "UNDERSTAFFED") ||
+		strings.Contains(verdict, "OVERSTAFFED")
+}
 
-	if len(targets) != 0 {
-		t.Errorf("%d targets left, want the pair to have picked it up", len(targets))
+// runUntilDone ticks until every target is gone (or maxTicks pass) and fails
+// the test on an illegal pickup. It returns the ticks used.
+func runUntilDone(t *testing.T, m *Map, robots []*Robot, targets []*Target, maxTicks int) ([]*Target, int) {
+	t.Helper()
+	for len(targets) > 0 && m.turn < maxTicks {
+		var verdict string
+		verdict, targets = Tick(m, robots, targets)
+		if illegal(verdict) {
+			t.Fatalf("illegal behaviour: %s", verdict)
+		}
 	}
-	if waiter.onTarget || partner.onTarget {
-		t.Errorf("robots still waiting after the pickup: waiter=%v partner=%v", waiter.onTarget, partner.onTarget)
+	return targets, m.turn
+}
+
+// A waiter calls for help and the closest free robot walks over; the far robot stays out.
+func TestClosestRobotAnswersTheCall(t *testing.T) {
+	m := &Map{size: 10}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
+	far := &Robot{id: 2, row: 0, col: 9, facing: "S"}
+	near := &Robot{id: 3, row: 5, col: 3, facing: "E"}
+	robots := []*Robot{waiter, far, near}
+	targets := []*Target{{id: 0, row: 5, col: 5}}
+
+	partner := 0
+	for i := 0; i < 10 && partner == 0; i++ {
+		Tick(m, robots, targets)
+		partner = waiter.partner
+	}
+	if partner != near.id {
+		t.Fatalf("partner = r%d, want the closer robot r%d", partner, near.id)
+	}
+
+	targets, _ = runUntilDone(t, m, robots, targets, 100)
+	if len(targets) != 0 {
+		t.Fatal("the pair never picked up the target")
+	}
+	for _, r := range robots {
+		if r.onTarget || r.offer.owner != 0 || r.partner != 0 {
+			t.Errorf("%s still holds a job after the pickup", r.label())
+		}
+	}
+}
+
+// Robots that step onto the same target in the same iteration sort it out:
+// the higher IDs leave and the lowest ID gets a partner.
+func TestRobotsArrivingTogetherSortItOut(t *testing.T) {
+	for _, n := range []int{2, 3} {
+		m := &Map{size: 10}
+		robots := []*Robot{
+			{id: 1, row: 5, col: 4, facing: "E"},
+			{id: 2, row: 5, col: 6, facing: "W"},
+			{id: 3, row: 4, col: 5, facing: "S"},
+		}[:n]
+		targets, ticks := runUntilDone(t, m, robots, []*Target{{id: 0, row: 5, col: 5}}, 500)
+		if len(targets) != 0 {
+			t.Errorf("%d robots arriving together: target still there after %d ticks", n, ticks)
+		}
+	}
+}
+
+// With nobody free, waiters on different targets must not all wait for ever.
+func TestWaitersOnDifferentTargetsHelpEachOther(t *testing.T) {
+	m := &Map{size: 10}
+	robots := []*Robot{
+		{id: 1, row: 2, col: 2, facing: "N", onTarget: true},
+		{id: 2, row: 7, col: 7, facing: "N", onTarget: true},
+	}
+	targets := []*Target{{id: 0, row: 2, col: 2}, {id: 1, row: 7, col: 7}}
+
+	targets, ticks := runUntilDone(t, m, robots, targets, 500)
+	// The freed helper may find the other target and finish it too, so 0 or 1 is fine.
+	if len(targets) == 2 {
+		t.Fatalf("both targets left after %d ticks, want at least one picked up", ticks)
+	}
+}
+
+// A message with a delay of d is read d iterations later than normal.
+func TestMessageDelay(t *testing.T) {
+	m := &Map{size: 10, delay: func() int { return 2 }}
+	sender := &Robot{id: 1, row: 5, col: 5, facing: "N"}
+	receiver := &Robot{id: 2, row: 0, col: 0, facing: "N"}
+
+	sender.send(Message{kind: msgHelp, from: 1, row: 5, col: 5})
+	sender.SendMessage(m, []*Robot{sender, receiver})
+	if len(sender.inbox) != 0 || len(receiver.inbox) != 1 {
+		t.Fatalf("inboxes hold %d and %d messages, want 0 and 1", len(sender.inbox), len(receiver.inbox))
+	}
+
+	for i := 0; i < 2; i++ {
+		receiver.ReceiveMessage(m)
+		if len(receiver.outbox) != 0 {
+			t.Fatalf("read the message %d iterations early", 2-i)
+		}
+	}
+	receiver.ReceiveMessage(m)
+	if len(receiver.outbox) != 1 || receiver.outbox[0].kind != msgClaim {
+		t.Fatalf("outbox = %v, want a CLAIM after the delay", receiver.outbox)
+	}
+}
+
+// A claim for a request the waiter has moved on from is released, so the helper is not stuck.
+func TestLateClaimIsReleased(t *testing.T) {
+	m := &Map{size: 10}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, seq: 3}
+
+	waiter.handle(m, Message{kind: msgClaim, from: 2, to: 1, seq: 2, dist: 4}) // an earlier request
+	if len(waiter.claims) != 0 || len(waiter.outbox) != 1 || waiter.outbox[0].kind != msgRelease {
+		t.Fatalf("stale claim: claims=%v outbox=%v, want it released", waiter.claims, waiter.outbox)
+	}
+}
+
+// The whole protocol, with and without delay, never produces an illegal pickup
+// and always finishes the targets.
+func TestFullRun(t *testing.T) {
+	delays := map[string]func() int{
+		"no delay":    nil,
+		"exponential": func() int { return int(rand.ExpFloat64() * 3) },
+	}
+	for name, delay := range delays {
+		for run := 0; run < 20; run++ {
+			m := &Map{size: 10, delay: delay}
+			robots, targets := RandomPlacement(10, 6, 4)
+			targets, ticks := runUntilDone(t, m, robots, targets, 20000)
+			if len(targets) != 0 {
+				t.Fatalf("%s, run %d: %d targets left after %d ticks", name, run, len(targets), ticks)
+			}
+		}
+	}
+}
+
+// A new set of targets appears when none are left, on cells without robots.
+func TestTickRespawnsTargets(t *testing.T) {
+	m := &Map{size: 10, respawn: 3, nextTarget: 3}
+	robots, _ := RandomPlacement(10, 5, 0)
+	before := map[pos]bool{} // robots may step onto a new target during the tick itself
+	for _, r := range robots {
+		before[pos{r.row, r.col}] = true
+	}
+
+	verdict, targets := Tick(m, robots, nil)
+	if len(targets) != 3 || !strings.Contains(verdict, "spawned 3 new targets") {
+		t.Fatalf("got %d targets and verdict %q, want 3 new targets", len(targets), verdict)
+	}
+	seen := map[pos]bool{}
+	for i, tg := range targets {
+		cell := pos{tg.row, tg.col}
+		if seen[cell] || tg.id != 3+i {
+			t.Errorf("target %d at %v: shares a cell or has the wrong ID", tg.id, cell)
+		}
+		seen[cell] = true
+		if before[cell] {
+			t.Errorf("%s spawned on top of a robot", tg.label())
+		}
+	}
+
+	// While targets remain, nothing is added.
+	if _, again := Tick(m, robots, targets); len(again) != 3 {
+		t.Errorf("%d targets after a normal tick, want 3", len(again))
+	}
+}
+
+// A run keeps going: every time the targets are collected, a new set appears.
+func TestRespawnKeepsTheRunGoing(t *testing.T) {
+	m := &Map{size: 10, respawn: 2, nextTarget: 2}
+	robots, targets := RandomPlacement(10, 6, 2)
+	for m.turn < 5000 && m.nextTarget < 8 {
+		var verdict string
+		verdict, targets = Tick(m, robots, targets)
+		if illegal(verdict) {
+			t.Fatalf("illegal behaviour: %s", verdict)
+		}
+	}
+	if m.nextTarget < 8 {
+		t.Fatalf("only %d targets ever existed after %d ticks, want the sets to be replaced", m.nextTarget, m.turn)
+	}
+}
+
+// Changing only the iterations continues the board; changing a count restarts it.
+func TestApplyContinuesTheBoard(t *testing.T) {
+	g := NewGame()
+	g.panel.values = [fieldCount]string{"4", "3", "10"}
+	g.apply()
+	robots := g.robots
+	if len(robots) != 4 || len(g.targets) != 3 || !g.running {
+		t.Fatalf("first apply: %d robots, %d targets, running=%v", len(robots), len(g.targets), g.running)
+	}
+
+	g.m.turn = 10 // the run used up its iterations
+	g.running = false
+	g.panel.values[fieldIterations] = "25"
+	g.apply()
+	if g.robots[0] != robots[0] || g.m.turn != 10 || g.iterations != 25 || !g.running {
+		t.Errorf("more iterations: turn=%d iterations=%d running=%v, want the same board continuing", g.m.turn, g.iterations, g.running)
+	}
+
+	g.panel.values[fieldIterations] = "5" // fewer than already done
+	g.apply()
+	if g.running || g.m.turn != 10 {
+		t.Errorf("iterations below the current turn: running=%v turn=%d, want it stopped", g.running, g.m.turn)
+	}
+
+	g.panel.values[fieldRobots] = "5"
+	g.apply()
+	if g.m.turn != 0 || len(g.robots) != 5 {
+		t.Errorf("new robot count: turn=%d robots=%d, want a fresh board", g.m.turn, len(g.robots))
+	}
+}
+
+// With no delay, every receiver gets at most one packet per sender per turn.
+func TestOnePacketPerTurn(t *testing.T) {
+	m := &Map{size: 10, respawn: 5, nextTarget: 5}
+	robots, targets := RandomPlacement(10, 10, 5)
+	multi := 0
+	for m.turn < 2000 {
+		_, targets = Tick(m, robots, targets)
+		for _, r := range robots {
+			from := map[int]bool{}
+			for _, d := range r.inbox {
+				if from[d.msgs[0].from] {
+					t.Fatalf("turn %d: r%d got two packets from r%d", m.turn, r.id, d.msgs[0].from)
+				}
+				from[d.msgs[0].from] = true
+				if len(d.msgs) > 1 {
+					multi++
+				}
+			}
+		}
+	}
+	if multi == 0 {
+		t.Error("no packet ever held more than one message; the test is not exercising bundling")
 	}
 }
