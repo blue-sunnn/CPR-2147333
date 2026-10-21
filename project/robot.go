@@ -35,16 +35,27 @@ type Robot struct {
 	arrived      int // the Map.turn when this robot last moved into its current cell
 	history      [4]int
 	onTarget     bool // true if the robot is currently on a target
+
+	// Communication (comms.go).
+	inbox  []delivery
+	outbox []Message
+
+	// Waiter: request number, first/last call and first claim turns, partner,
+	// and the claims received (helper ID -> distance).
+	seq, waitingSince, helpAt, claimedAt, partner int
+	claims                                        map[int]int
+
+	// Helper: the request it claimed or was accepted for.
+	offer offer
 }
 
-// PreMove returns the cell the robot would enter if it moved forward,
-// without moving it. The simulation checks that cell before calling Move.
+// PreMove returns the cell a forward move would enter, without moving.
 func (r *Robot) PreMove() (row, col int) {
 	d := deltas[r.facing]
 	return r.row + d[0], r.col + d[1]
 }
 
-// Move steps one cell forward. The simulation checks the step first (see PreMove).
+// Move steps one cell forward; the simulation checks the cell first.
 func (r *Robot) Move() {
 	r.row, r.col = r.PreMove()
 	r.record(Forward)
@@ -61,37 +72,30 @@ func (r *Robot) TurnRight() {
 	r.record(Right)
 }
 
-func (r *Robot) SendMessage(msg string) {
-	
-}
-
-func (r *Robot) ReceiveMessage() {
-
-}
-
-// record appends a move to history, dropping the oldest. Forward is the zero
-// value, so a fresh robot's empty history reads as four forward moves.
+// record appends a move to history, dropping the oldest. Forward is 0, so a
+// fresh history reads as four forward moves.
 func (r *Robot) record(move int) {
 	copy(r.history[:3], r.history[1:])
 	r.history[3] = move
 }
 
-// label is the name shown on screen and in messages, e.g. "r1".
+// label is the robot's name, e.g. "r1".
 func (r *Robot) label() string { return fmt.Sprintf("r%d", r.id) }
 
 // Sensing is what a robot can sense at the start of an iteration.
 type Sensing struct {
+	turn        int // the current iteration
 	wallAhead   bool
 	targetAhead bool  // a target is in the cell in front
 	robotsAhead []int // IDs of the robots in the cell in front, lowest first
 	robotsHere  []int // IDs of the other robots in the robot's own cell, lowest first
 }
 
-// Sense looks at the world as it is right now, without changing anything.
+// Sense looks at the world as it is now, changing nothing.
 func (r *Robot) Sense(m *Map, robots []*Robot, targets []*Target) Sensing {
 	frontRow, frontCol := r.PreMove()
 
-	var s Sensing
+	s := Sensing{turn: m.turn}
 	s.wallAhead = !m.IsInBounds(frontRow, frontCol)
 
 	for _, t := range targets {
@@ -113,7 +117,7 @@ func (r *Robot) Sense(m *Map, robots []*Robot, targets []*Target) Sensing {
 	return s
 }
 
-// The four things a robot can do in one iteration.
+// What a robot does in one iteration.
 const (
 	actionMove   = "MOVE"
 	actionLeft   = "LEFT"
@@ -122,23 +126,27 @@ const (
 	actionStay   = "STAY"
 )
 
-// allActions lists them in the order they are reported in the log.
-var allActions = []string{actionMove, actionLeft, actionRight, actionPickup, actionStay}
-
-// Decide picks this iteration's action (one of allActions) from what the robot
-// sensed. This is a placeholder that ignores `s` and acts at random; replace it
-// with the real rules.
+// Decide picks this iteration's action: waiters wait, accepted helpers walk to
+// their waiter (comms.go), everyone else wanders at random.
 func (r *Robot) Decide(s Sensing) string {
 	n := rand.IntN(100)
 
 	switch {
 	case r.onTarget:
-		if len(s.robotsHere) > 0 {return actionPickup}
+		return r.decideWaiting(s)
 
-		return actionStay
+	case r.offer.accepted:
+		return r.decideHelping(s)
+
+	case s.targetAhead && (len(s.robotsAhead) > 0 || r.offer.owner != 0):
+		// Target taken, or a claim still unanswered: turn away.
+		if n < 50 {
+			return actionLeft
+		}
+		return actionRight
 
 	case s.targetAhead:
-		r.onTarget = true
+		r.startWaiting()
 		return actionMove
 
 	case s.wallAhead:
