@@ -21,11 +21,10 @@ const (
 	gap          = 4   // space between squares, and around the edge of the board
 	margin       = 20  // space left and right of the board
 	topBar       = 64  // room above the board for the heading
-	logBar       = 156 // room below the board for the log
 	panelWidth   = 200 // the settings panel to the right of the board
 	boardSize    = N*cellSize + (N+1)*gap
 	ScreenWidth  = margin + boardSize + margin + panelWidth + margin
-	ScreenHeight = topBar + boardSize + logBar
+	ScreenHeight = topBar + boardSize + margin
 )
 
 // Sizes of the things drawn on the board.
@@ -45,23 +44,16 @@ const (
 	starOutline    = 5    // pixels
 
 	titleSize = 18
-	logSize   = 13
-
-	logLines  = 5  // how many log lines fit in the log box
-	logLineH  = 20 // pixels per log line
-	logBoxGap = 12 // space between the board and the log box
-	logPad    = 12 // space between the log box edge and its text
 )
 
 var (
-	bgColor      = color.RGBA{0xfa, 0xf8, 0xef, 0xff}
-	frameColor   = color.RGBA{0xbb, 0xad, 0xa0, 0xff}
-	emptyColor   = color.RGBA{0xcd, 0xc1, 0xb4, 0xff}
-	textColor    = color.RGBA{0x77, 0x6e, 0x65, 0xff}
-	dimTextColor = color.RGBA{0xa3, 0x9a, 0x8d, 0xff}
-	starColor    = color.RGBA{0xed, 0xc2, 0x2e, 0xff}
-	starEdge     = color.RGBA{0xd9, 0xa4, 0x1c, 0xff}
-	shadowColor  = color.NRGBA{0, 0, 0, 45}
+	bgColor     = color.RGBA{0xfa, 0xf8, 0xef, 0xff}
+	frameColor  = color.RGBA{0xbb, 0xad, 0xa0, 0xff}
+	emptyColor  = color.RGBA{0xcd, 0xc1, 0xb4, 0xff}
+	textColor   = color.RGBA{0x77, 0x6e, 0x65, 0xff}
+	starColor   = color.RGBA{0xed, 0xc2, 0x2e, 0xff}
+	starEdge    = color.RGBA{0xd9, 0xa4, 0x1c, 0xff}
+	shadowColor = color.NRGBA{0, 0, 0, 45}
 
 	// Robot i gets robotColors[i % len(robotColors)], by position in the robot list.
 	robotColors = []color.RGBA{
@@ -94,7 +86,6 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	drawAligned(screen, boldSource, "simulation", ScreenWidth/2, topBar/2, titleSize, textColor, text.AlignCenter)
 
 	g.drawBoard(screen)
-	g.drawLog(screen)
 	g.panel.Draw(screen)
 
 	for _, v := range g.tv {
@@ -124,28 +115,6 @@ func (g *Game) drawBoard(screen *ebiten.Image) {
 	op := &ebiten.DrawImageOptions{}
 	op.GeoM.Translate(margin, topBar)
 	screen.DrawImage(g.board, op)
-}
-
-// drawLog draws the most recent log lines in a box under the board, newest at
-// the bottom. Older lines are lighter.
-func (g *Game) drawLog(screen *ebiten.Image) {
-	x, y := float32(margin), float32(topBar+boardSize+logBoxGap)
-	w, h := float32(ScreenWidth-2*margin), float32(logBar-logBoxGap-margin)
-	fillRoundRect(screen, x, y, w, h, boardRadius, frameColor)
-	fillRoundRect(screen, x+gap, y+gap, w-2*gap, h-2*gap, cellRadius, emptyColor)
-
-	lines := g.log
-	if len(lines) > logLines {
-		lines = lines[len(lines)-logLines:]
-	}
-	for i, line := range lines {
-		clr := dimTextColor
-		if i == len(lines)-1 {
-			clr = textColor
-		}
-		line = fitText(line, logSize, float64(w)-2*logPad)
-		drawTextLeft(screen, line, float64(x)+logPad, float64(y)+logPad+(float64(i)+0.5)*logLineH, logSize, clr)
-	}
 }
 
 // screenX and screenY convert a position in cell units (0 is the center of the
@@ -261,22 +230,6 @@ func drawAligned(dst *ebiten.Image, source *text.GoTextFaceSource, s string, x, 
 	op.PrimaryAlign = align
 	op.SecondaryAlign = text.AlignCenter
 	text.Draw(dst, s, &text.GoTextFace{Source: source, Size: size}, op)
-}
-
-// fitText shortens s with an ellipsis until it is at most maxWidth pixels wide.
-func fitText(s string, size, maxWidth float64) string {
-	face := &text.GoTextFace{Source: fontSource, Size: size}
-	if w, _ := text.Measure(s, face, 0); w <= maxWidth {
-		return s
-	}
-	runes := []rune(s)
-	for len(runes) > 0 {
-		runes = runes[:len(runes)-1]
-		if w, _ := text.Measure(string(runes)+"…", face, 0); w <= maxWidth {
-			break
-		}
-	}
-	return string(runes) + "…"
 }
 
 // Draw paints the panel: heading, the three fields, and the Apply button.
