@@ -132,6 +132,16 @@ func ApplyLegalPickups(targets []*Target, report PickupReport) []*Target {
 	return remaining
 }
 
+// ReleaseRobots frees the robots standing on a cell where a pickup was legal,
+// so they stop waiting there and carry on.
+func ReleaseRobots(robots []*Robot, report PickupReport) {
+	for _, r := range robots {
+		if slices.Contains(report.legal, pos{r.row, r.col}) {
+			r.onTarget = false
+		}
+	}
+}
+
 // ------------------------------------------------------------ placement
 
 // ValidatePlacement rejects a starting layout that breaks the rules: every
@@ -232,6 +242,7 @@ func PickupStep(robots []*Robot, targets []*Target, name string) (string, []*Tar
 	verdict := "[" + name + "] " + describePickups(report)
 	fmt.Println(verdict)
 
+	ReleaseRobots(robots, report)
 	return verdict, ApplyLegalPickups(targets, report)
 }
 
@@ -245,7 +256,7 @@ func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 	// sees the result of another robot's action this iteration.
 	chosen := make([]string, len(robots))
 	for i, r := range robots {
-		chosen[i] = r.Decide(r.Sense(robots, targets))
+		chosen[i] = r.Decide(r.Sense(m, robots, targets))
 	}
 
 	var moves []MoveAction
@@ -283,6 +294,7 @@ func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 	if len(pickups) > 0 {
 		verdict += "; " + describePickups(report)
 	}
+	ReleaseRobots(robots, report)
 	return verdict, ApplyLegalPickups(targets, report)
 }
 
