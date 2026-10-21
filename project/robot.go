@@ -16,11 +16,25 @@ var (
 	rightOf = map[string]string{"N": "E", "E": "S", "S": "W", "W": "N"}
 )
 
+const (
+	Left    = -1
+	Forward = 0
+	Right   = 1
+)
+
+const (
+	weightForward = 65
+	weightLeft    = 20
+	weightRight   = 15
+)
+
 // Robot is one robot on the grid. IDs are unique and start at 1.
 type Robot struct {
 	id, row, col int
 	facing       string
 	arrived      int // the Map.turn when this robot last moved into its current cell
+	history      [4]int
+	onTarget     bool // true if the robot is currently on a target
 }
 
 // PreMove returns the cell the robot would enter if it moved forward,
@@ -33,15 +47,33 @@ func (r *Robot) PreMove() (row, col int) {
 // Move steps one cell forward. The simulation checks the step first (see PreMove).
 func (r *Robot) Move() {
 	r.row, r.col = r.PreMove()
+	r.record(Forward)
 }
 
 // TurnLeft and TurnRight rotate the robot 90 degrees in place.
 func (r *Robot) TurnLeft() {
 	r.facing = leftOf[r.facing]
+	r.record(Left)
 }
 
 func (r *Robot) TurnRight() {
 	r.facing = rightOf[r.facing]
+	r.record(Right)
+}
+
+func (r *Robot) SendMessage(msg string) {
+	
+}
+
+func (r *Robot) ReceiveMessage() {
+
+}
+
+// record appends a move to history, dropping the oldest. Forward is the zero
+// value, so a fresh robot's empty history reads as four forward moves.
+func (r *Robot) record(move int) {
+	copy(r.history[:3], r.history[1:])
+	r.history[3] = move
 }
 
 // label is the name shown on screen and in messages, e.g. "r1".
@@ -49,16 +81,19 @@ func (r *Robot) label() string { return fmt.Sprintf("r%d", r.id) }
 
 // Sensing is what a robot can sense at the start of an iteration.
 type Sensing struct {
+	wallAhead   bool
 	targetAhead bool  // a target is in the cell in front
 	robotsAhead []int // IDs of the robots in the cell in front, lowest first
 	robotsHere  []int // IDs of the other robots in the robot's own cell, lowest first
 }
 
 // Sense looks at the world as it is right now, without changing anything.
-func (r *Robot) Sense(robots []*Robot, targets []*Target) Sensing {
+func (r *Robot) Sense(m *Map, robots []*Robot, targets []*Target) Sensing {
 	frontRow, frontCol := r.PreMove()
 
 	var s Sensing
+	s.wallAhead = !m.IsInBounds(frontRow, frontCol)
+
 	for _, t := range targets {
 		if t.row == frontRow && t.col == frontCol {
 			s.targetAhead = true
@@ -84,26 +119,46 @@ const (
 	actionLeft   = "LEFT"
 	actionRight  = "RIGHT"
 	actionPickup = "PICKUP"
+	actionStay   = "STAY"
 )
 
 // allActions lists them in the order they are reported in the log.
-var allActions = []string{actionMove, actionLeft, actionRight, actionPickup}
+var allActions = []string{actionMove, actionLeft, actionRight, actionPickup, actionStay}
 
 // Decide picks this iteration's action (one of allActions) from what the robot
 // sensed. This is a placeholder that ignores `s` and acts at random; replace it
 // with the real rules.
-func (r *Robot) Decide(s Sensing) string { 
-	// switch {
-	// 	// actionMove
-	// 	case s.targetAhead: return actionMove
+func (r *Robot) Decide(s Sensing) string {
+	n := rand.IntN(100)
 
-	// 	// actionRight
+	switch {
+	case r.onTarget:
+		if len(s.robotsHere) > 0 {return actionPickup}
 
-	// 	// actionLeft
+		return actionStay
 
-	// 	// actionPickup
-		
-	// }
+	case s.targetAhead:
+		r.onTarget = true
+		return actionMove
 
-	return allActions[rand.IntN(len(allActions))]
+	case s.wallAhead:
+		if n < 80 {
+			return actionLeft
+		} else {
+			return actionRight
+		}
+
+	case r.history[1] != Forward && r.history[1] == r.history[2] && r.history[2] == r.history[3]:
+		return actionMove
+
+	default:
+		switch {
+		case n < weightForward:
+			return actionMove
+		case n < weightForward+weightLeft:
+			return actionLeft
+		default:
+			return actionRight
+		}
+	}
 }
