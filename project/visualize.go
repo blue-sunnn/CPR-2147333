@@ -12,21 +12,15 @@ import (
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
 )
 
-// This file connects the simulation to the window: it reads the keyboard,
-// runs the simulation steps, and keeps the animated "views" up to date.
-// draw.go turns those views into pixels.
-//
-// The simulation changes instantly (a robot jumps from one cell to the next).
-// Each robot and target has a view that glides toward the simulation state a
-// little every frame, which is what makes the movement look smooth.
+// Connects the simulation to the window: input, simulation steps and animated
+// "views". The simulation jumps instantly; each view glides toward it a little
+// every frame. draw.go turns the views into pixels.
 
 const (
 	easing      = 0.2 // fraction of the remaining distance a view covers each frame
 	stackOffset = 0.2 // gap, in cells, between robots that share a cell
 
-	tickFrames = 30 // frames between ticks while running (60 frames per second)
-
-	logMaxLines = 200 // log lines kept; older ones are dropped
+	tickFrames = 10 // frames between ticks while running (60 frames per second)
 )
 
 // view is how one robot or target is currently drawn.
@@ -46,13 +40,11 @@ func ease(cur *float64, goal float64) {
 	}
 }
 
-// Game is the window. It owns the simulation state (the map, the robots and
-// the targets) and the views that animate it.
+// Game is the window: the simulation state plus the views that animate it.
 type Game struct {
 	m       *Map
 	robots  []*Robot
 	targets []*Target
-	log     []string // one line per action, oldest first; the newest lines are drawn below the board
 
 	panel      *Panel
 	iterations int  // how many ticks a run lasts, from the panel
@@ -76,28 +68,33 @@ func NewGame() *Game {
 	}
 }
 
-// addLog adds one line to the log shown under the board.
-func (g *Game) addLog(line string) {
-	g.log = append(g.log, line)
-	if len(g.log) > logMaxLines {
-		g.log = g.log[len(g.log)-logMaxLines:]
-	}
-}
-
-// apply starts over with the robot, target and iteration counts from the panel,
-// placing everything at random cells.
+// apply reads the panel. If only the iterations changed, the run continues on
+// the current board up to the new total; otherwise it starts a new random board.
 func (g *Game) apply() {
 	if slices.Contains(g.panel.values[:], "") {
-		g.addLog("[panel] fill in robots, targets and iterations first")
+		fmt.Println("[panel] fill in robots, targets and iterations first")
 		return
 	}
 	robots, targets, iterations := g.panel.Value(fieldRobots), g.panel.Value(fieldTargets), g.panel.Value(fieldIterations)
 	if robots+targets > N*N {
-		g.addLog(fmt.Sprintf("[panel] cannot fit %d robots and %d targets on a %dx%d grid", robots, targets, N, N))
+		fmt.Println(fmt.Sprintf("[panel] cannot fit %d robots and %d targets on a %dx%d grid", robots, targets, N, N))
+		return
+	}
+
+	if robots == len(g.robots) && targets == g.m.respawn && g.robots != nil {
+		g.iterations = iterations
+		g.running = g.m.turn < iterations
+		g.wait = 0
+		if g.running {
+			fmt.Println(fmt.Sprintf("[panel] continuing from iteration %d up to %d", g.m.turn, iterations))
+		} else {
+			fmt.Println(fmt.Sprintf("[panel] already at iteration %d; enter more than that to continue", g.m.turn))
+		}
 		return
 	}
 
 	g.robots, g.targets = RandomPlacement(N, robots, targets)
+	g.m.respawn, g.m.nextTarget = targets, targets
 	g.iterations = iterations
 	g.running = iterations > 0
 	g.wait = 0
@@ -105,7 +102,7 @@ func (g *Game) apply() {
 	clear(g.rv)
 	clear(g.tv)
 	g.order = nil
-	g.addLog(fmt.Sprintf("[panel] new run: %d robots, %d targets, %d iterations", robots, targets, iterations))
+	fmt.Println(fmt.Sprintf("[panel] new run: %d robots, %d targets, %d iterations", robots, targets, iterations))
 }
 
 // Layout, Update and Draw (in draw.go) are what Ebitengine calls to run the window.
@@ -138,10 +135,10 @@ func (g *Game) runTick() {
 
 	var verdict string
 	verdict, g.targets = Tick(g.m, g.robots, g.targets)
-	g.addLog(verdict)
+	fmt.Println(verdict)
 	if g.m.turn >= g.iterations {
 		g.running = false
-		g.addLog(fmt.Sprintf("[sim] finished after %d iterations", g.iterations))
+		fmt.Println(fmt.Sprintf("[sim] finished after %d iterations", g.iterations))
 	}
 }
 
@@ -149,21 +146,21 @@ func (g *Game) runTick() {
 func (g *Game) handleKeys() {
 	switch {
 	case inpututil.IsKeyJustPressed(ebiten.KeySpace):
-		g.addLog(MoveStep(g.m, g.robots, "manual"))
+		fmt.Println(MoveStep(g.m, g.robots, "manual"))
 	case inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft):
 		for _, r := range g.robots {
 			r.TurnLeft()
 		}
-		g.addLog("[manual] TURN LEFT")
+		fmt.Println("[manual] TURN LEFT")
 	case inpututil.IsKeyJustPressed(ebiten.KeyArrowRight):
 		for _, r := range g.robots {
 			r.TurnRight()
 		}
-		g.addLog("[manual] TURN RIGHT")
+		fmt.Println("[manual] TURN RIGHT")
 	case inpututil.IsKeyJustPressed(ebiten.KeyP):
 		var verdict string
 		verdict, g.targets = PickupStep(g.robots, g.targets, "manual")
-		g.addLog(verdict)
+		fmt.Println(verdict)
 	}
 }
 
@@ -247,9 +244,7 @@ func drawOrder(robots []*Robot) []*Robot {
 	return order
 }
 
-// stackShift is how far, in cells, a robot is nudged along both axes when
-// `count` robots share a cell and it is number `layer` from the bottom.
-// The group stays centered on the cell.
+// stackShift nudges robot number `layer` of `count` sharing a cell, keeping the group centered.
 func stackShift(layer, count int) float64 {
 	return (float64(layer) - float64(count-1)/2) * stackOffset
 }
@@ -276,9 +271,8 @@ func turnToward(from, to float64) float64 {
 
 // ------------------------------------------------------- settings panel
 
-// The panel to the right of the board: three number fields (robots, targets,
-// iterations) and an Apply button. Click a field to type in it; Tab moves to
-// the next field and Enter applies.
+// Right of the board: robots, targets and iterations fields plus Apply.
+// Click a field to type, Tab moves on, Enter applies.
 
 const (
 	fieldRobots = iota
@@ -294,13 +288,15 @@ const (
 	fieldHeight  = 36
 	fieldSpacing = 16 // between one field box and the next label
 	buttonHeight = 40
-	maxDigits    = 3
 
 	backspaceDelay  = 30 // frames the key is held before it starts repeating
 	backspaceRepeat = 3  // then it deletes once every this many frames
 )
 
 var fieldLabels = [fieldCount]string{"Robots", "Targets", "Iterations"}
+
+// maxDigits per field; robots and targets are bounded by the grid.
+var maxDigits = [fieldCount]int{3, 3, 6}
 
 var (
 	fieldColor  = color.RGBA{0xfa, 0xf8, 0xef, 0xff}
@@ -371,7 +367,7 @@ func (p *Panel) Update() (apply bool) {
 
 	v := &p.values[p.focus]
 	for _, c := range ebiten.AppendInputChars(nil) {
-		if c >= '0' && c <= '9' && len(*v) < maxDigits {
+		if c >= '0' && c <= '9' && len(*v) < maxDigits[p.focus] {
 			*v += string(c)
 		}
 	}
