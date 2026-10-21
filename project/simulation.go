@@ -8,16 +8,9 @@ import (
 	"strings"
 )
 
-// The rules of the simulation. Nothing here knows about the window.
-//
-// Every tick follows the same three steps, so an illegal action is caught
-// before anything changes:
-//  1. decide:  list what each robot wants to do (MoveAction / PickupAction)
-//  2. check:   CheckMoveActions / CheckPickupActions sort them into legal and illegal
-//  3. apply:   ApplyLegalMoves / ApplyLegalPickups carry out only the legal ones
-//
-// Tick runs all three steps for every robot at once (one iteration). MoveStep
-// and PickupStep run them for one kind of action only; the keyboard uses those.
+// The rules of the simulation (nothing here knows about the window). Every tick:
+// decide what each robot wants, check it (legal or illegal), apply only the
+// legal actions. MoveStep and PickupStep do this for one action kind (keyboard).
 
 // N is the width and height of the grid.
 const N = 10
@@ -132,22 +125,25 @@ func ApplyLegalPickups(targets []*Target, report PickupReport) []*Target {
 	return remaining
 }
 
-// ReleaseRobots frees the robots standing on a cell where a pickup was legal,
-// so they stop waiting there and carry on.
-func ReleaseRobots(robots []*Robot, report PickupReport) {
-	for _, r := range robots {
-		if slices.Contains(report.legal, pos{r.row, r.col}) {
-			r.onTarget = false
+// ReleaseRobots resets the robots that took part in a legal pickup. A robot that
+// merely walked into the cell keeps its own job.
+func ReleaseRobots(robots []*Robot, actions []PickupAction, report PickupReport) {
+	for _, a := range actions {
+		if !slices.Contains(report.legal, pos{a.row, a.col}) {
+			continue
+		}
+		for _, r := range robots {
+			if r.id == a.robotID {
+				r.resetJob()
+			}
 		}
 	}
 }
 
 // ------------------------------------------------------------ placement
 
-// ValidatePlacement rejects a starting layout that breaks the rules: every
-// robot needs a unique ID and a real facing, everything must start on the
-// grid, and nothing may share a cell. (Robots may share a cell later, while
-// the simulation runs; that is how two of them pick up a target.)
+// ValidatePlacement rejects a starting layout with duplicate IDs, bad facings,
+// cells off the grid or two things on one cell (robots may share cells later).
 func ValidatePlacement(m *Map, robots []*Robot, targets []*Target) error {
 	ids := map[int]bool{}
 	for _, r := range robots {
@@ -185,9 +181,8 @@ func ValidatePlacement(m *Map, robots []*Robot, targets []*Target) error {
 	return nil
 }
 
-// RandomPlacement puts the given number of robots (IDs 1, 2, ...) and targets
-// (IDs 0, 1, ...) on distinct random cells of an n x n grid. The robots face
-// random directions. The caller checks that everything fits.
+// RandomPlacement puts robots (IDs 1, 2, ...) and targets (IDs 0, 1, ...) on
+// distinct random cells, robots facing randomly. The caller checks it all fits.
 func RandomPlacement(n, robots, targets int) ([]*Robot, []*Target) {
 	cells := rand.Perm(n * n)
 	facings := []string{"N", "E", "S", "W"}
@@ -205,11 +200,30 @@ func RandomPlacement(n, robots, targets int) ([]*Robot, []*Target) {
 	return rs, ts
 }
 
+// SpawnTargets adds m.respawn targets on random cells without a robot.
+func SpawnTargets(m *Map, robots []*Robot) []*Target {
+	occupied := map[pos]bool{}
+	for _, r := range robots {
+		occupied[pos{r.row, r.col}] = true
+	}
+
+	var targets []*Target
+	for _, c := range rand.Perm(m.size * m.size) {
+		if len(targets) == m.respawn {
+			break
+		}
+		cell := pos{c / m.size, c % m.size}
+		if !occupied[cell] {
+			targets = append(targets, &Target{id: m.nextTarget, row: cell.row, col: cell.col})
+			m.nextTarget++
+		}
+	}
+	return targets
+}
+
 // ---------------------------------------------------------------- ticks
 
-// MoveStep runs one MOVE tick for the given robots: every robot decides to
-// step forward, the steps are checked, and only the legal ones happen. It
-// returns a one-line verdict. `name` only labels the verdict.
+// MoveStep runs one tick where every robot steps forward if legal. Returns a verdict.
 func MoveStep(m *Map, robots []*Robot, name string) string {
 	m.turn++
 
@@ -223,7 +237,6 @@ func MoveStep(m *Map, robots []*Robot, name string) string {
 	verdict := "[" + name + "] MOVE"
 	if len(outOfBounds) > 0 {
 		verdict = "[" + name + "] " + describeMoves(outOfBounds)
-		fmt.Println(verdict)
 	}
 
 	ApplyLegalMoves(robots, legal, m.turn)
@@ -239,18 +252,29 @@ func PickupStep(robots []*Robot, targets []*Target, name string) (string, []*Tar
 	}
 
 	report := CheckPickupActions(targets, actions)
-	verdict := "[" + name + "] " + describePickups(report)
-	fmt.Println(verdict)
+	verdict := "[" + name + "] " + describePickups(report, actions)
 
-	ReleaseRobots(robots, report)
+	ReleaseRobots(robots, actions, report)
 	return verdict, ApplyLegalPickups(targets, report)
 }
 
-// Tick runs one iteration: every robot senses and decides an action, the moves
-// and pickups are checked, and only the legal ones happen. The iteration number
+// Tick runs one iteration, in the order the project requires: robots read their
+// messages, sense and decide, the moves and pickups are checked, only the legal
+// ones happen, and finally the robots send their messages. The iteration number
 // is m.turn. It returns a one-line verdict and the targets that remain.
 func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 	m.turn++
+
+	// When no targets are left, a new set appears before anyone moves.
+	spawned := 0
+	if len(targets) == 0 && m.respawn > 0 {
+		targets = SpawnTargets(m, robots)
+		spawned = len(targets)
+	}
+
+	for _, r := range robots {
+		r.ReceiveMessage(m)
+	}
 
 	// Everyone senses and decides before anything changes, so no robot
 	// sees the result of another robot's action this iteration.
@@ -261,9 +285,7 @@ func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 
 	var moves []MoveAction
 	var pickups []PickupAction
-	counts := map[string]int{}
 	for i, r := range robots {
-		counts[chosen[i]]++
 		switch chosen[i] {
 		case actionMove:
 			row, col := r.PreMove()
@@ -281,20 +303,27 @@ func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 	report := CheckPickupActions(targets, pickups)
 	ApplyLegalMoves(robots, legalMoves, m.turn)
 
-	var parts []string
-	for _, a := range allActions {
-		if counts[a] > 0 {
-			parts = append(parts, fmt.Sprintf("%s %d", a, counts[a]))
-		}
+	var events []string
+	if spawned > 0 {
+		events = append(events, fmt.Sprintf("spawned %d new targets", spawned))
 	}
-	verdict := fmt.Sprintf("[tick %d] %s", m.turn, strings.Join(parts, ", "))
 	if len(outOfBounds) > 0 {
-		verdict += "; " + describeMoves(outOfBounds)
+		events = append(events, describeMoves(outOfBounds))
 	}
 	if len(pickups) > 0 {
-		verdict += "; " + describePickups(report)
+		events = append(events, describePickups(report, pickups))
 	}
-	ReleaseRobots(robots, report)
+	ReleaseRobots(robots, pickups, report)
+	for _, r := range robots {
+		if line := r.SendMessage(m, robots); line != "" {
+			events = append(events, line)
+		}
+	}
+
+	verdict := fmt.Sprintf("[%d]", m.turn)
+	if len(events) > 0 {
+		verdict += "\n  " + strings.Join(events, "\n  ")
+	}
 	return verdict, ApplyLegalPickups(targets, report)
 }
 
@@ -311,7 +340,7 @@ func describeMoves(outOfBounds []MoveAction) string {
 	return fmt.Sprintf("OUT_OF_BOUNDS MOVE by [%s] (blocked)", strings.Join(parts, ", "))
 }
 
-func describePickups(report PickupReport) string {
+func describePickups(report PickupReport, actions []PickupAction) string {
 	var parts []string
 	add := func(name string, cells []pos) {
 		if len(cells) > 0 {
@@ -321,7 +350,15 @@ func describePickups(report PickupReport) string {
 	add("NO_TARGET", report.noTarget)
 	add("UNDERSTAFFED", report.understaffed)
 	add("OVERSTAFFED", report.overstaffed)
-	add("LEGAL pickup", report.legal)
+	for _, cell := range report.legal {
+		var ids []string
+		for _, a := range actions {
+			if a.row == cell.row && a.col == cell.col {
+				ids = append(ids, fmt.Sprintf("r%d", a.robotID))
+			}
+		}
+		parts = append(parts, fmt.Sprintf("LEGAL pickup at (%d, %d) by %s", cell.row, cell.col, strings.Join(ids, ", ")))
+	}
 
 	if len(parts) == 0 {
 		return "no PICKUP decided this tick"
