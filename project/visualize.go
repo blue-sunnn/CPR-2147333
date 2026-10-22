@@ -20,7 +20,7 @@ const (
 	easing      = 0.2 // fraction of the remaining distance a view covers each frame
 	stackOffset = 0.2 // gap, in cells, between robots that share a cell
 
-	tickFrames = 10 // frames between ticks while running (60 frames per second)
+	tickFrames = 5 // frames between ticks while running (60 frames per second)
 )
 
 // view is how one robot or target is currently drawn.
@@ -136,7 +136,10 @@ func (g *Game) runTick() {
 	var verdict string
 	verdict, g.targets = Tick(g.m, g.robots, g.targets)
 	fmt.Println(verdict)
-	if g.m.turn >= g.iterations {
+	if g.m.illegal {
+		g.running = false
+		fmt.Println(fmt.Sprintf("[sim] stopped at iteration %d: illegal action", g.m.turn))
+	} else if g.m.turn >= g.iterations {
 		g.running = false
 		fmt.Println(fmt.Sprintf("[sim] finished after %d iterations", g.iterations))
 	}

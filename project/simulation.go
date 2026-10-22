@@ -70,6 +70,11 @@ type PickupReport struct {
 	legalTargets []*Target // the targets at the legal cells
 }
 
+// hasIllegal reports whether any attempted pickup broke the rule.
+func (r PickupReport) hasIllegal() bool {
+	return len(r.noTarget)+len(r.understaffed)+len(r.overstaffed) > 0
+}
+
 // CheckPickupActions applies the pickup rule: a target can only be picked up
 // by exactly two robots at the same time.
 func CheckPickupActions(targets []*Target, actions []PickupAction) PickupReport {
@@ -301,6 +306,7 @@ func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 
 	legalMoves, outOfBounds := CheckMoveActions(m, moves)
 	report := CheckPickupActions(targets, pickups)
+	m.illegal = len(outOfBounds) > 0 || report.hasIllegal()
 	ApplyLegalMoves(robots, legalMoves, m.turn)
 
 	var events []string

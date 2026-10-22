@@ -460,3 +460,42 @@ func TestOnePacketPerTurn(t *testing.T) {
 		t.Error("no packet ever held more than one message; the test is not exercising bundling")
 	}
 }
+
+// Any pickup that is not exactly two robots on a target counts as illegal and
+// makes the run stop; a correct pair, or no pickups at all, does not.
+func TestPickupReportHasIllegal(t *testing.T) {
+	targets := []*Target{{id: 0, row: 1, col: 1}}
+	pick := func(cells ...pos) []PickupAction {
+		var as []PickupAction
+		for i, c := range cells {
+			as = append(as, PickupAction{i + 1, c.row, c.col})
+		}
+		return as
+	}
+	here, elsewhere := pos{1, 1}, pos{2, 2}
+
+	for name, tc := range map[string]struct {
+		actions []PickupAction
+		want    bool
+	}{
+		"none":         {nil, false},
+		"legal pair":   {pick(here, here), false},
+		"no target":    {pick(elsewhere), true},
+		"understaffed": {pick(here), true},
+		"overstaffed":  {pick(here, here, here), true},
+	} {
+		if got := CheckPickupActions(targets, tc.actions).hasIllegal(); got != tc.want {
+			t.Errorf("%s: hasIllegal = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+// A tick with nothing illegal leaves the flag off.
+func TestTickIllegalFlagOffWhenLegal(t *testing.T) {
+	m := &Map{size: 10, illegal: true}
+	r := &Robot{id: 1, row: 5, col: 4, facing: "E"}
+	Tick(m, []*Robot{r}, []*Target{{id: 0, row: 5, col: 5}})
+	if m.illegal {
+		t.Error("illegal still set after a legal tick")
+	}
+}

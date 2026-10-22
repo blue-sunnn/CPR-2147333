@@ -5,6 +5,8 @@ type Map struct {
 	size int
 	turn int // iterations so far
 
+	illegal bool // the last Tick found an illegal move or pickup
+
 	respawn, nextTarget int // targets added when none are left (0 = never); next new ID
 
 	delay func() int // extra iterations per message per receiver; nil = none
