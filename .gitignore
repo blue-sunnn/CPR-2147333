@@ -9,3 +9,4 @@
 
 # Compiled program from `go build`
 /project/cpr
+/project/simulation_test.go
