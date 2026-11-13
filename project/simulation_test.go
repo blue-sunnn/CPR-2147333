@@ -1,6 +1,7 @@
 package main
 
 import (
+	"math"
 	"math/rand/v2"
 	"slices"
 	"strings"
@@ -206,18 +207,30 @@ func TestRobotStepsOntoTarget(t *testing.T) {
 	}
 }
 
-// A lone robot on a target keeps waiting; it never picks up on its own.
-func TestLoneWaiterKeepsWaiting(t *testing.T) {
+// A lone robot on a target never picks up on its own: there is nobody to pair
+// with, so it waits, gives up after giveUpAfter ticks and the target stays.
+func TestLoneWaiterNeverPicksUp(t *testing.T) {
 	m := &Map{size: 10}
 	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
 	targets := []*Target{{id: 0, row: 5, col: 5}}
 
-	for i := 0; i < 30; i++ {
+	for i := 0; i < giveUpAfter-1; i++ {
 		_, targets = Tick(m, []*Robot{waiter}, targets)
 	}
 	if waiter.row != 5 || waiter.col != 5 || !waiter.onTarget || len(targets) != 1 {
-		t.Fatalf("lone waiter moved or left: at (%d, %d), onTarget=%v, %d targets left",
+		t.Fatalf("lone waiter moved or left early: at (%d, %d), onTarget=%v, %d targets left",
 			waiter.row, waiter.col, waiter.onTarget, len(targets))
+	}
+
+	for i := 0; i < 200; i++ {
+		var verdict string
+		verdict, targets = Tick(m, []*Robot{waiter}, targets)
+		if illegal(verdict) {
+			t.Fatalf("illegal behaviour: %s", verdict)
+		}
+	}
+	if len(targets) != 1 {
+		t.Fatal("a lone robot picked up a target")
 	}
 }
 
@@ -242,31 +255,31 @@ func runUntilDone(t *testing.T, m *Map, robots []*Robot, targets []*Target, maxT
 	return targets, m.turn
 }
 
-// A waiter calls for help and the closest free robot walks over; the far robot stays out.
-func TestClosestRobotAnswersTheCall(t *testing.T) {
-	m := &Map{size: 10}
-	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
-	far := &Robot{id: 2, row: 0, col: 9, facing: "S"}
-	near := &Robot{id: 3, row: 5, col: 3, facing: "E"}
-	robots := []*Robot{waiter, far, near}
-	targets := []*Target{{id: 0, row: 5, col: 5}}
+// A waiter runs a Paxos round, a free robot is chosen and walks over, the pair
+// picks up, and afterwards nobody keeps a job. The third robot stays out.
+func TestWaiterGetsAPartner(t *testing.T) {
+	for name, delay := range map[string]func() int{
+		"no delay":    nil,
+		"exponential": func() int { return int(rand.ExpFloat64() * 3) },
+	} {
+		m := &Map{size: 10, delay: delay}
+		waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
+		a := &Robot{id: 2, row: 0, col: 9, facing: "S"}
+		b := &Robot{id: 3, row: 5, col: 3, facing: "E"}
+		robots := []*Robot{waiter, a, b}
+		targets := []*Target{{id: 0, row: 5, col: 5}}
 
-	partner := 0
-	for i := 0; i < 10 && partner == 0; i++ {
-		Tick(m, robots, targets)
-		partner = waiter.partner
-	}
-	if partner != near.id {
-		t.Fatalf("partner = r%d, want the closer robot r%d", partner, near.id)
-	}
-
-	targets, _ = runUntilDone(t, m, robots, targets, 100)
-	if len(targets) != 0 {
-		t.Fatal("the pair never picked up the target")
-	}
-	for _, r := range robots {
-		if r.onTarget || r.offer.owner != 0 || r.partner != 0 {
-			t.Errorf("%s still holds a job after the pickup", r.label())
+		targets, ticks := runUntilDone(t, m, robots, targets, 500)
+		if len(targets) != 0 {
+			t.Fatalf("%s: the target was still there after %d ticks", name, ticks)
+		}
+		for _, r := range robots {
+			if r.onTarget || r.partner != 0 {
+				t.Errorf("%s: %s still holds a job after the pickup", name, r.label())
+			}
+			if pr, ok := r.decided[0]; ok && pr.a != waiter.id {
+				t.Errorf("%s: %s decided %+v, want the waiter r1 in the pair", name, r.label(), pr)
+			}
 		}
 	}
 }
@@ -293,7 +306,7 @@ func TestWaitersOnDifferentTargetsHelpEachOther(t *testing.T) {
 	m := &Map{size: 10}
 	robots := []*Robot{
 		{id: 1, row: 2, col: 2, facing: "N", onTarget: true},
-		{id: 2, row: 7, col: 7, facing: "N", onTarget: true},
+		{id: 2, row: 7, col: 7, facing: "N", onTarget: true, targetID: 1, jobTarget: instance(1, 0)},
 	}
 	targets := []*Target{{id: 0, row: 2, col: 2}, {id: 1, row: 7, col: 7}}
 
@@ -310,7 +323,7 @@ func TestMessageDelay(t *testing.T) {
 	sender := &Robot{id: 1, row: 5, col: 5, facing: "N"}
 	receiver := &Robot{id: 2, row: 0, col: 0, facing: "N"}
 
-	sender.send(Message{kind: msgHelp, from: 1, row: 5, col: 5})
+	sender.send(Message{kind: msgPrepare, from: 1, target: 0, n: 101, row: 5, col: 5})
 	sender.SendMessage(m, []*Robot{sender, receiver})
 	if len(sender.inbox) != 0 || len(receiver.inbox) != 1 {
 		t.Fatalf("inboxes hold %d and %d messages, want 0 and 1", len(sender.inbox), len(receiver.inbox))
@@ -323,19 +336,443 @@ func TestMessageDelay(t *testing.T) {
 		}
 	}
 	receiver.ReceiveMessage(m)
-	if len(receiver.outbox) != 1 || receiver.outbox[0].kind != msgClaim {
-		t.Fatalf("outbox = %v, want a CLAIM after the delay", receiver.outbox)
+	if len(receiver.outbox) != 1 || receiver.outbox[0].kind != msgPromise {
+		t.Fatalf("outbox = %v, want a PROMISE after the delay", receiver.outbox)
 	}
 }
 
-// A claim for a request the waiter has moved on from is released, so the helper is not stuck.
-func TestLateClaimIsReleased(t *testing.T) {
-	m := &Map{size: 10}
-	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, seq: 3}
+// outboxKinds lists the kinds of the messages a robot has queued.
+func outboxKinds(r *Robot) []string {
+	var kinds []string
+	for _, msg := range r.outbox {
+		kinds = append(kinds, msg.kind)
+	}
+	return kinds
+}
 
-	waiter.handle(m, Message{kind: msgClaim, from: 2, to: 1, seq: 2, dist: 4}) // an earlier request
-	if len(waiter.claims) != 0 || len(waiter.outbox) != 1 || waiter.outbox[0].kind != msgRelease {
-		t.Fatalf("stale claim: claims=%v outbox=%v, want it released", waiter.claims, waiter.outbox)
+// firstOfKind returns the first queued message of the given kind, or nil.
+func firstOfKind(msgs []Message, kind string) *Message {
+	for i := range msgs {
+		if msgs[i].kind == kind {
+			return &msgs[i]
+		}
+	}
+	return nil
+}
+
+// An acceptor promises only to a proposal number higher than any it has promised.
+func TestAcceptorPromisesOnlyHigherNumbers(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	r := &Robot{id: 2, row: 5, col: 3, facing: "N"}
+
+	for _, n := range []int{101, 101, 5, 102} { // the 2nd and 3rd are not higher
+		r.handle(m, Message{kind: msgPrepare, from: 1, target: 0, n: n, row: 5, col: 5})
+	}
+	if got := outboxKinds(r); !slices.Equal(got, []string{msgPromise, msgPromise}) {
+		t.Fatalf("outbox = %v, want exactly two PROMISEs (for 101 and 102)", got)
+	}
+	if r.outbox[1].n != 102 || !r.outbox[1].free || r.outbox[1].dist != 2 {
+		t.Errorf("second PROMISE = %+v, want n 102, free, dist 2", r.outbox[1])
+	}
+}
+
+// A PROMISE reports a value the acceptor already accepted, so a later proposer can adopt it.
+func TestPromiseReportsAcceptedValue(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	r := &Robot{id: 2, row: 5, col: 3, facing: "N"}
+
+	r.handle(m, Message{kind: msgAccept, from: 1, target: 0, n: 101, val: pair{1, 2}, row: 5, col: 5})
+	r.outbox = nil
+	r.handle(m, Message{kind: msgPrepare, from: 3, target: 0, n: 203, row: 5, col: 5})
+
+	if len(r.outbox) != 1 || r.outbox[0].accN != 101 || r.outbox[0].val != (pair{1, 2}) {
+		t.Fatalf("outbox = %+v, want one PROMISE carrying accN 101 and the pair r1+r2", r.outbox)
+	}
+}
+
+// An acceptor refuses an ACCEPT below its promise, and accepts one at or above it.
+func TestAcceptorRefusesBelowPromise(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	r := &Robot{id: 2, row: 5, col: 3, facing: "N"}
+	r.handle(m, Message{kind: msgPrepare, from: 3, target: 0, n: 203, row: 5, col: 5})
+	r.outbox = nil
+
+	r.handle(m, Message{kind: msgAccept, from: 1, target: 0, n: 101, val: pair{1, 2}})
+	if len(r.outbox) != 0 || r.accOf(0).accN != 0 {
+		t.Fatalf("accepted n=101 after promising 203: outbox=%v accN=%d", r.outbox, r.accOf(0).accN)
+	}
+	r.handle(m, Message{kind: msgAccept, from: 3, target: 0, n: 203, val: pair{3, 2}})
+	if got := outboxKinds(r); !slices.Equal(got, []string{msgAccepted}) || r.accOf(0).accN != 203 {
+		t.Fatalf("outbox = %v accN = %d, want ACCEPTED for n=203", got, r.accOf(0).accN)
+	}
+}
+
+// A helper that already works on one target is never named for another.
+func TestBusyHelperRefusesSecondTarget(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	r := &Robot{id: 2, row: 5, col: 3, facing: "N", partner: 1, jobTarget: 0}
+
+	r.handle(m, Message{kind: msgAccept, from: 3, target: 1, n: 103, val: pair{3, 2}})
+	if len(r.outbox) != 0 || r.accOf(1).accN != 0 {
+		t.Fatalf("a busy helper accepted a second target: outbox=%v", r.outbox)
+	}
+}
+
+// The proposer must adopt a value an acceptor already accepted, not its own choice.
+func TestProposerAdoptsAcceptedValue(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	r3 := &Robot{id: 3, row: 5, col: 5, facing: "N", onTarget: true, propN: 203}
+
+	// r1 is free and close, but r2 already accepted the pair r1+r2 with n=101.
+	r3.handle(m, Message{kind: msgPromise, from: 1, to: 3, target: 0, n: 203, free: true, dist: 1})
+	r3.handle(m, Message{kind: msgPromise, from: 2, to: 3, target: 0, n: 203, accN: 101, val: pair{1, 2}})
+
+	if acc := firstOfKind(r3.outbox, msgAccept); acc == nil || acc.val != (pair{1, 2}) {
+		t.Fatalf("outbox = %+v, want an ACCEPT for the old pair r1+r2", r3.outbox)
+	}
+}
+
+// With no old value, the proposer picks the closest free promiser (never itself).
+func TestProposerPicksClosestFreeRobot(t *testing.T) {
+	m := &Map{size: 10, robots: 5}
+	r1 := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, propN: 101}
+
+	for _, p := range []Message{
+		{from: 2, dist: 6, free: true},
+		{from: 3, dist: 2, free: false}, // busy, even though closest
+		{from: 4, dist: 3, free: true},
+	} {
+		p.kind, p.to, p.target, p.n = msgPromise, 1, 0, 101
+		r1.handle(m, p)
+	}
+	if acc := firstOfKind(r1.outbox, msgAccept); acc == nil || acc.val != (pair{1, 4}) {
+		t.Fatalf("outbox = %+v, want an ACCEPT for r1+r4", r1.outbox)
+	}
+}
+
+// A late PROMISE from an old round is ignored.
+func TestStalePromiseIsIgnored(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	r1 := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, propN: 201}
+
+	r1.handle(m, Message{kind: msgPromise, from: 2, to: 1, target: 0, n: 101, free: true, dist: 1})
+	r1.handle(m, Message{kind: msgPromise, from: 3, to: 1, target: 0, n: 101, free: true, dist: 1})
+	if len(r1.outbox) != 0 || len(r1.promises) != 0 {
+		t.Fatalf("a promise for n=101 was used in round 201: outbox=%v", r1.outbox)
+	}
+}
+
+// A value is decided only after a majority of matching ACCEPTED messages. Then
+// the waiter of the pair takes its partner and sends GO, and a waiter that was
+// left out leaves. The helper does nothing until it gets GO.
+func TestLearnerDecidesOnMajority(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
+	helper := &Robot{id: 2, row: 5, col: 2, facing: "N"}
+	loser := &Robot{id: 3, row: 5, col: 5, facing: "N", onTarget: true}
+	robots := []*Robot{waiter, helper, loser}
+
+	accepted := func(from int) Message {
+		return Message{kind: msgAccepted, from: from, target: 0, n: 101, val: pair{1, 2}, row: 5, col: 5}
+	}
+	for _, r := range robots {
+		r.handle(m, accepted(1))
+		if _, done := r.decided[0]; done {
+			t.Fatalf("%s decided after a single ACCEPTED", r.label())
+		}
+	}
+	for _, r := range robots {
+		r.handle(m, accepted(2))
+		if r.decided[0] != (pair{1, 2}) {
+			t.Fatalf("%s did not decide r1+r2 after a majority: %+v", r.label(), r.decided)
+		}
+	}
+
+	if waiter.partner != 2 || !waiter.onTarget {
+		t.Errorf("waiter: partner=%d onTarget=%v, want partner r2 and still waiting", waiter.partner, waiter.onTarget)
+	}
+	if go1 := firstOfKind(waiter.outbox, msgGo); go1 == nil || go1.to != 2 {
+		t.Errorf("waiter outbox = %v, want a GO to r2", waiter.outbox)
+	}
+	if helper.partner != 0 {
+		t.Errorf("helper has partner r%d before any GO", helper.partner)
+	}
+	if loser.onTarget || loser.partner != 0 {
+		t.Errorf("loser: onTarget=%v partner=%d, want it to have left", loser.onTarget, loser.partner)
+	}
+
+	// The hand-over: GO, then ACK back, then READY.
+	helper.handle(m, *firstOfKind(waiter.outbox, msgGo))
+	if helper.partner != 1 || helper.goalRow != 5 || helper.goalCol != 5 || helper.ready {
+		t.Errorf("helper after GO: partner=%d goal=(%d,%d) ready=%v, want partner r1, goal (5,5), not ready yet",
+			helper.partner, helper.goalRow, helper.goalCol, helper.ready)
+	}
+	if got := helper.Decide(m, Sensing{turn: 2}); got == actionPickup {
+		t.Errorf("helper picked up before READY")
+	}
+	ack := firstOfKind(helper.outbox, msgAck)
+	if ack == nil {
+		t.Fatalf("helper outbox = %v, want an ACK", helper.outbox)
+	}
+
+	waiter.handle(m, *ack)
+	ready := firstOfKind(waiter.outbox, msgReady)
+	if !waiter.acked || ready == nil {
+		t.Fatalf("waiter after ACK: acked=%v outbox=%v, want acked and a READY", waiter.acked, waiter.outbox)
+	}
+	helper.handle(m, *ready)
+	if !helper.ready {
+		t.Error("helper not ready after READY")
+	}
+	if got := helper.Decide(m, Sensing{turn: 3}); got == actionStay {
+		t.Error("helper still waiting after READY, want it to walk")
+	}
+}
+
+// A GO only starts a helper that is free and named in it; a stale one is ignored.
+func TestGoOnlyStartsAFreeNamedHelper(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	goMsg := Message{kind: msgGo, from: 1, to: 2, target: 0, val: pair{1, 2}, row: 5, col: 5}
+
+	busy := &Robot{id: 2, row: 1, col: 1, facing: "N", onTarget: true}
+	busy.handle(m, goMsg)
+	if busy.partner != 0 {
+		t.Error("a robot waiting on another target started on a GO")
+	}
+
+	stale := goMsg        // instance(0, 5): epoch 0
+	m.turn = epochLen + 3 // but we are in epoch 1 now
+	idle := &Robot{id: 2, row: 1, col: 1, facing: "N"}
+	idle.handle(m, stale)
+	if idle.partner != 0 {
+		t.Error("a GO from an earlier epoch started a helper")
+	}
+}
+
+// A helper that accepted a value naming it stays free for that instance only:
+// it refuses to be named for a second one at the same time.
+func TestHelperIsReservedForOneInstance(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	r := &Robot{id: 2, row: 5, col: 3, facing: "N"}
+
+	r.handle(m, Message{kind: msgAccept, from: 1, target: instance(0, 5), n: 101, val: pair{1, 2}})
+	if r.accOf(instance(0, 5)).accN != 101 || !r.reserved(m.turn) {
+		t.Fatalf("helper did not accept and reserve itself: accN=%d reserved=%v", r.accOf(instance(0, 5)).accN, r.reserved(m.turn))
+	}
+	r.outbox = nil
+	r.handle(m, Message{kind: msgAccept, from: 5, target: instance(1, 5), n: 105, val: pair{5, 2}})
+	if len(r.outbox) != 0 {
+		t.Fatalf("a reserved helper accepted a second pair: %v", r.outbox)
+	}
+	m.turn += reserveFor // the reservation ran out
+	r.handle(m, Message{kind: msgAccept, from: 5, target: instance(1, m.turn), n: 105, val: pair{5, 2}})
+	if len(r.outbox) == 0 {
+		t.Fatal("the helper stayed reserved after the reservation ran out")
+	}
+}
+
+// A pair that has not picked up by the end of its epoch is dropped: the waiter
+// starts a fresh Paxos instance instead of waiting for ever.
+func TestPairIsDroppedAtEpochEnd(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: epochLen - 2}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, partner: 2, acked: true, propAt: m.turn, waitingSince: m.turn}
+
+	for i := 0; i < 4; i++ {
+		m.turn++
+		waiter.Decide(m, Sensing{turn: m.turn})
+	}
+	if waiter.partner != 0 || waiter.jobTarget != instance(0, epochLen) {
+		t.Fatalf("partner=%d instance=%d, want the old pair dropped and the epoch-1 instance", waiter.partner, waiter.jobTarget)
+	}
+	if firstOfKind(waiter.outbox, msgPrepare) == nil {
+		t.Error("the waiter did not start a new round after the epoch changed")
+	}
+}
+
+// A waiter only picks up once its helper has committed (ACK). A robot that
+// merely walks through the cell is not its partner, even if the IDs match.
+func TestWaiterPicksUpOnlyAfterAck(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 1}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, partner: 2}
+
+	if got := waiter.Decide(m, Sensing{turn: 1, robotsHere: []int{2}}); got == actionPickup {
+		t.Fatal("picked up with a partner that never sent ACK")
+	}
+	waiter.handle(m, Message{kind: msgAck, from: 2, to: 1, target: 0, val: pair{1, 2}})
+	if got := waiter.Decide(m, Sensing{turn: 2, robotsHere: []int{2}}); got != actionPickup {
+		t.Fatalf("got %s, want PICKUP once the partner has committed", got)
+	}
+	if got := waiter.Decide(m, Sensing{turn: 3, robotsHere: []int{2, 3}}); got == actionPickup {
+		t.Error("picked up with a third robot in the cell")
+	}
+}
+
+// A helper takes a GO once: a second waiter that names it too is ignored.
+func TestHelperCommitsToOneWaiter(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	helper := &Robot{id: 3, row: 1, col: 1, facing: "N"}
+
+	helper.handle(m, Message{kind: msgGo, from: 1, to: 3, target: instance(0, 5), val: pair{1, 3}, row: 5, col: 5})
+	helper.outbox = nil
+	helper.handle(m, Message{kind: msgGo, from: 2, to: 3, target: instance(1, 5), val: pair{2, 3}, row: 7, col: 7})
+	if helper.partner != 1 || len(helper.outbox) != 0 {
+		t.Fatalf("partner=%d outbox=%v, want it to stay with r1 and send no second ACK", helper.partner, helper.outbox)
+	}
+}
+
+// A helper that starts in the waiter's cell steps out first and sends its ACK
+// only once outside, so the waiter can never see it before it has committed.
+func TestHelperInTheWaitersCellStepsOutBeforeAck(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	helper := &Robot{id: 3, row: 5, col: 5, facing: "E"}
+	helper.handle(m, Message{kind: msgGo, from: 1, to: 3, target: instance(0, 5), val: pair{1, 3}, row: 5, col: 5})
+
+	if got := helper.Decide(m, Sensing{turn: 5}); got != actionMove {
+		t.Fatalf("got %s, want MOVE out of the waiter's cell", got)
+	}
+	if firstOfKind(helper.outbox, msgAck) != nil {
+		t.Fatal("ACK sent while still in the waiter's cell")
+	}
+	helper.col++ // it moved out
+	helper.Decide(m, Sensing{turn: 6})
+	if firstOfKind(helper.outbox, msgAck) == nil {
+		t.Fatal("no ACK once outside the waiter's cell")
+	}
+}
+
+// A committed helper walks straight away, but stops at the edge of the waiter's
+// cell until READY comes.
+func TestHelperWalksButWaitsAtTheDoor(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	helper := &Robot{id: 3, row: 5, col: 2, facing: "E", partner: 1, goalRow: 5, goalCol: 5, jobTarget: instance(0, 5)}
+
+	for i := 0; i < 2; i++ { // (5,2) -> (5,4)
+		if got := helper.Decide(m, Sensing{turn: 5}); got != actionMove {
+			t.Fatalf("step %d: got %s, want MOVE", i, got)
+		}
+		helper.col++
+	}
+	if got := helper.Decide(m, Sensing{turn: 5}); got != actionStay {
+		t.Fatalf("at the door: got %s, want STAY until READY", got)
+	}
+	helper.ready = true
+	if got := helper.Decide(m, Sensing{turn: 5}); got != actionMove {
+		t.Fatalf("after READY: got %s, want MOVE into the cell", got)
+	}
+}
+
+// Two waiters in one cell: only the lower ID proposes (it can recruit the other,
+// and the higher one's proposal numbers would otherwise always outrank it).
+func TestOnlyTheLowerIDInACellProposes(t *testing.T) {
+	m := &Map{size: 10, robots: 4, turn: 3}
+	low := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true}
+	high := &Robot{id: 2, row: 5, col: 5, facing: "N", onTarget: true}
+
+	low.Decide(m, Sensing{turn: 3, robotsHere: []int{2}})
+	high.Decide(m, Sensing{turn: 3, robotsHere: []int{1}})
+	if firstOfKind(low.outbox, msgPrepare) == nil {
+		t.Error("the lower ID did not propose")
+	}
+	if firstOfKind(high.outbox, msgPrepare) != nil {
+		t.Error("the higher ID proposed while a lower ID shared its cell")
+	}
+}
+
+// A waiter whose partner never commits (it went to another waiter) frees itself.
+func TestWaiterGivesUpOnAPartnerThatNeverAcks(t *testing.T) {
+	m := &Map{size: 10, robots: 3}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, partner: 3, propAt: 1, waitingSince: 1}
+
+	waiter.Decide(m, Sensing{turn: 1 + giveUpAfter - 1})
+	if !waiter.onTarget {
+		t.Fatal("gave up too early")
+	}
+	waiter.Decide(m, Sensing{turn: 1 + giveUpAfter})
+	if waiter.onTarget || waiter.partner != 0 {
+		t.Errorf("onTarget=%v partner=%d, want it freed after giveUpAfter ticks", waiter.onTarget, waiter.partner)
+	}
+}
+
+// A waiter that has waited a while offers itself as helper to a lower ID (and
+// only a lower ID); a waiter in the proposer's own cell offers at once.
+func TestWaitingRobotHelpsALowerID(t *testing.T) {
+	r := &Robot{id: 3, row: 2, col: 2, facing: "N", onTarget: true, waitingSince: 1}
+	turn := 1 + helpAfter
+
+	if !r.willingToHelp(turn, 1, 5, 5) {
+		t.Error("a waiter that waited long enough refused to help a lower ID")
+	}
+	if r.willingToHelp(turn-1, 1, 5, 5) {
+		t.Error("offered to help before helpAfter ticks")
+	}
+	if !r.willingToHelp(1, 1, 2, 2) {
+		t.Error("a waiter in the proposer's cell did not offer at once")
+	}
+	if r.willingToHelp(turn, 4, 5, 5) {
+		t.Error("offered to help a higher ID")
+	}
+	r.partner = 1
+	if r.willingToHelp(turn, 1, 5, 5) {
+		t.Error("offered to help while it already has a partner")
+	}
+}
+
+// Targets everywhere: every robot becomes a waiter on its own target, so nobody
+// is free. The waiting robots must help each other, or nothing is ever collected.
+func TestTargetsEverywhere(t *testing.T) {
+	for name, delay := range map[string]func() int{
+		"no delay":    nil,
+		"exponential": func() int { return int(rand.ExpFloat64() * 3) },
+	} {
+		for run := 0; run < 10; run++ {
+			m := &Map{size: 10, delay: delay}
+			robots, targets := RandomPlacement(10, 4, 96)
+			start := len(targets)
+			for m.turn < 3000 && len(targets) > start-10 {
+				var verdict string
+				verdict, targets = Tick(m, robots, targets)
+				if illegal(verdict) {
+					t.Fatalf("%s, run %d: illegal behaviour: %s", name, run, verdict)
+				}
+			}
+			if got := start - len(targets); got < 10 {
+				t.Fatalf("%s, run %d: only %d targets collected in %d ticks", name, run, got, m.turn)
+			}
+		}
+	}
+}
+
+// Two proposers on the same target (same cell, same moment): every robot ends
+// up with the same pair, and nothing illegal happens.
+func TestTwoProposersAgree(t *testing.T) {
+	for name, delay := range map[string]func() int{
+		"no delay":    nil,
+		"exponential": func() int { return int(rand.ExpFloat64() * 3) },
+	} {
+		for run := 0; run < 50; run++ {
+			m := &Map{size: 10, delay: delay}
+			robots := []*Robot{
+				{id: 1, row: 5, col: 4, facing: "E"},
+				{id: 2, row: 5, col: 6, facing: "W"},
+				{id: 3, row: 2, col: 5, facing: "S"},
+				{id: 4, row: 8, col: 5, facing: "N"},
+				{id: 5, row: 0, col: 0, facing: "S"},
+			}
+			targets, ticks := runUntilDone(t, m, robots, []*Target{{id: 0, row: 5, col: 5}}, 2000)
+			if len(targets) != 0 {
+				t.Fatalf("%s, run %d: target left after %d ticks", name, run, ticks)
+			}
+			var first pair
+			for _, r := range robots {
+				if pr, ok := r.decided[0]; ok {
+					if first == (pair{}) {
+						first = pr
+					} else if pr != first {
+						t.Fatalf("%s, run %d: robots decided different pairs %+v and %+v", name, run, first, pr)
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -497,5 +934,255 @@ func TestTickIllegalFlagOffWhenLegal(t *testing.T) {
 	Tick(m, []*Robot{r}, []*Target{{id: 0, row: 5, col: 5}})
 	if m.illegal {
 		t.Error("illegal still set after a legal tick")
+	}
+}
+
+// A lone wandering robot visits every cell, without ever leaving the grid.
+func TestSweepVisitsEveryCell(t *testing.T) {
+	for _, facing := range []string{"N", "E", "S", "W"} {
+		m := &Map{size: 10}
+		r := &Robot{id: 1, row: 4, col: 6, facing: facing}
+		seen := map[pos]bool{}
+		for i := 0; i < 3*N*N; i++ {
+			Tick(m, []*Robot{r}, nil)
+			if m.illegal {
+				t.Fatalf("facing %s: tried to leave the grid at (%d, %d)", facing, r.row, r.col)
+			}
+			seen[pos{r.row, r.col}] = true
+		}
+		if len(seen) != N*N {
+			t.Errorf("facing %s: visited %d of %d cells", facing, len(seen), N*N)
+		}
+	}
+}
+
+// A stale sweep stage (the sweep was interrupted by a target or job) must not walk into the wall.
+func TestStaleSweepStageStaysInGrid(t *testing.T) {
+	m := &Map{size: 10}
+	r := &Robot{id: 1, row: 0, col: 5, facing: "N", sweepStage: 1}
+	Tick(m, []*Robot{r}, nil)
+	if m.illegal {
+		t.Fatal("stale sweep stage moved the robot out of the grid")
+	}
+}
+
+// ------------------------------------------------- communication delay edge cases
+
+// delayShapes are delay functions that stress the protocol: tiny, epoch-long,
+// bimodal (most messages fast, a few cross an epoch), uniform, heavy-tailed.
+func delayShapes() map[string]func() int {
+	return map[string]func() int{
+		"exp(3)":     ExponentialDelay(3),
+		"exp(8)":     ExponentialDelay(8),
+		"const 1":    func() int { return 1 },
+		"const 99":   func() int { return epochLen - 1 },
+		"uniform 60": func() int { return rand.IntN(61) },
+		"bimodal": func() int {
+			if rand.Float64() < 0.85 {
+				return 0
+			}
+			return epochLen + rand.IntN(150)
+		},
+		"heavy tail": func() int { return min(5000, int(math.Pow(1-rand.Float64(), -1/1.2)-1)) },
+	}
+}
+
+// However late or reordered the messages are, the robots may stall but must
+// never attempt an illegal pickup. (Safety does not depend on timing.)
+func TestNoIllegalPickupUnderAnyDelay(t *testing.T) {
+	for name, delay := range delayShapes() {
+		for _, c := range []struct{ robots, targets int }{{2, 1}, {3, 3}, {5, 2}, {12, 20}, {4, 90}} {
+			for run := 0; run < 5; run++ {
+				m := &Map{size: 10, delay: delay, respawn: c.targets, nextTarget: c.targets}
+				robots, targets := RandomPlacement(10, c.robots, c.targets)
+				for m.turn < 2500 {
+					var verdict string
+					verdict, targets = Tick(m, robots, targets)
+					if illegal(verdict) {
+						t.Fatalf("%s, %d robots, %d targets, run %d: illegal behaviour: %s", name, c.robots, c.targets, run, verdict)
+					}
+				}
+			}
+		}
+	}
+}
+
+// A negative delay must not lose the message: it is read as if there were no delay.
+// (Today wait never reaches 0, so the packet stays in the inbox for ever.)
+func TestNegativeDelayStillDelivers(t *testing.T) {
+	m := &Map{size: 10, delay: func() int { return -3 }}
+	sender := &Robot{id: 1, row: 5, col: 5, facing: "N"}
+	receiver := &Robot{id: 2, row: 0, col: 0, facing: "N"}
+
+	sender.send(Message{kind: msgPrepare, from: 1, target: 0, n: 101, row: 5, col: 5})
+	sender.SendMessage(m, []*Robot{sender, receiver})
+	for i := 0; i < 3; i++ {
+		receiver.ReceiveMessage(m)
+	}
+	if len(receiver.inbox) != 0 {
+		t.Fatalf("%d packets still in the inbox after 3 iterations, want it delivered", len(receiver.inbox))
+	}
+}
+
+// A waiter that gives up on a helper that never ACKed tells it, so the helper is
+// not left standing at the door for the rest of the epoch.
+func TestHelperIsFreedWhenTheWaiterGivesUp(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	inst := instance(0, 5)
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, partner: 3, jobTarget: inst, propAt: 5, waitingSince: 5}
+	helper := &Robot{id: 3, row: 5, col: 4, facing: "E", partner: 1, goalRow: 5, goalCol: 5, jobTarget: inst, ackSent: true}
+
+	m.turn = 5 + giveUpAfter
+	waiter.Decide(m, Sensing{turn: m.turn})
+	cancel := firstOfKind(waiter.outbox, msgCancel)
+	if waiter.onTarget || cancel == nil || cancel.to != 3 {
+		t.Fatalf("onTarget=%v outbox=%v, want the waiter to leave and CANCEL r3", waiter.onTarget, waiter.outbox)
+	}
+	helper.handle(m, *cancel)
+	if helper.partner != 0 || helper.jobTarget != 0 {
+		t.Fatalf("partner=%d job=%d, want the helper free after CANCEL", helper.partner, helper.jobTarget)
+	}
+}
+
+// A CANCEL only frees a helper from the waiter and instance it is committed to,
+// and never one that already has READY (it may be stepping into the cell).
+func TestCancelOnlyFreesTheRightHelper(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 5}
+	inst := instance(0, 5)
+	for name, c := range map[string]struct {
+		cancel Message
+		ready  bool
+	}{
+		"other waiter":   {Message{kind: msgCancel, from: 2, to: 3, target: inst}, false},
+		"other instance": {Message{kind: msgCancel, from: 1, to: 3, target: instance(1, 5)}, false},
+		"already READY":  {Message{kind: msgCancel, from: 1, to: 3, target: inst}, true},
+	} {
+		helper := &Robot{id: 3, row: 5, col: 4, facing: "E", partner: 1, goalRow: 5, goalCol: 5, jobTarget: inst, ackSent: true, ready: c.ready}
+		helper.handle(m, c.cancel)
+		if helper.partner != 1 {
+			t.Errorf("%s: the helper let go of its waiter", name)
+		}
+	}
+}
+
+// A slow network is allowed to be slow, not to stop the robots altogether.
+func TestSlowDelayStillMakesProgress(t *testing.T) {
+	collected := 0
+	for run := 0; run < 10; run++ {
+		m := &Map{size: 10, delay: ExponentialDelay(20), respawn: 1, nextTarget: 1}
+		robots, targets := RandomPlacement(10, 4, 1)
+		for m.turn < 10000 {
+			before := len(targets)
+			var verdict string
+			verdict, targets = Tick(m, robots, targets)
+			if illegal(verdict) {
+				t.Fatalf("illegal behaviour: %s", verdict)
+			}
+			if len(targets) < before {
+				collected++
+			}
+		}
+	}
+	if collected < 30 {
+		t.Fatalf("only %d targets collected in 10 runs of 10000 iterations with a mean delay of 20", collected)
+	}
+}
+
+// A long run keeps what each robot remembers about old targets within bounds.
+func TestOldInstancesAreForgotten(t *testing.T) {
+	m := &Map{size: 10, delay: ExponentialDelay(3), respawn: 3, nextTarget: 3}
+	robots, targets := RandomPlacement(10, 6, 3)
+	for m.turn < 20000 {
+		_, targets = Tick(m, robots, targets)
+	}
+	for _, r := range robots {
+		if n := len(r.acc) + len(r.decided) + len(r.tally); n > 300 {
+			t.Fatalf("%s keeps %d old Paxos records after %d iterations, want old epochs dropped", r.label(), n, m.turn)
+		}
+	}
+}
+
+// ------------------------------------------------------ adaptive timeouts
+
+// Timeouts keep their sized-for values on a fast network and stretch on a slow one.
+func TestTimeoutsStretchWithObservedDelay(t *testing.T) {
+	r := &Robot{id: 1}
+	if r.ticks(giveUpAfter) != giveUpAfter || r.level() != 0 {
+		t.Fatalf("fresh robot: giveUpAfter=%d level=%d, want the base values", r.ticks(giveUpAfter), r.level())
+	}
+	for i := 0; i < 20; i++ {
+		r.observe(0)
+	}
+	if r.ticks(giveUpAfter) != giveUpAfter {
+		t.Errorf("a fast network stretched giveUpAfter to %d", r.ticks(giveUpAfter))
+	}
+	for i := 0; i < 500; i++ {
+		r.observe(30)
+	}
+	if got := r.ticks(giveUpAfter); got < 5*giveUpAfter {
+		t.Errorf("giveUpAfter = %d after a mean delay of ~30, want it stretched at least 5x", got)
+	}
+	if r.level() < 2 {
+		t.Errorf("level = %d after a mean delay of ~30, want longer epochs", r.level())
+	}
+}
+
+// A robot learns the delay from the packets it receives, by how much later than
+// the earliest possible iteration each one is read.
+func TestRobotLearnsDelayFromPackets(t *testing.T) {
+	m := &Map{size: 10, delay: func() int { return 10 }}
+	sender := &Robot{id: 1}
+	receiver := &Robot{id: 2}
+	for i := 0; i < 200; i++ {
+		m.turn++
+		sender.send(Message{kind: msgPrepare, from: 1, n: 101})
+		sender.SendMessage(m, []*Robot{sender, receiver})
+		receiver.ReceiveMessage(m)
+	}
+	if receiver.meanDelay < 8 || receiver.meanDelay > 12 {
+		t.Fatalf("meanDelay = %.1f, want about 10", receiver.meanDelay)
+	}
+}
+
+// The end of an epoch is part of the instance number, so a waiter and a helper
+// that estimate the delay differently still reset on the very same iteration.
+func TestEpochEndComesFromTheInstance(t *testing.T) {
+	inst := instanceAt(0, 250, 2) // level 2: epochs of 400, this one is [0, 400)
+	if got := epochEnd(inst); got != 4*epochLen {
+		t.Fatalf("epochEnd = %d, want %d", got, 4*epochLen)
+	}
+
+	m := &Map{size: 10, robots: 3, turn: 250}
+	helper := &Robot{id: 3, row: 5, col: 4, facing: "E", partner: 1, goalRow: 5, goalCol: 5, jobTarget: inst, ackSent: true, ready: true}
+	waiter := &Robot{id: 1, row: 5, col: 5, facing: "N", onTarget: true, partner: 3, acked: true, jobTarget: inst, propAt: 250, waitingSince: 250}
+	for m.turn = 250; m.turn < 4*epochLen; m.turn++ {
+		helper.Decide(m, Sensing{turn: m.turn})
+		waiter.Decide(m, Sensing{turn: m.turn})
+		if helper.partner == 0 || waiter.partner == 0 {
+			t.Fatalf("pair dropped at iteration %d, before its epoch ended at %d", m.turn, 4*epochLen)
+		}
+	}
+	m.turn = 4 * epochLen
+	helper.Decide(m, Sensing{turn: m.turn})
+	waiter.Decide(m, Sensing{turn: m.turn})
+	if helper.partner != 0 || waiter.partner != 0 {
+		t.Fatalf("partners %d and %d at the end of the epoch, want both dropped on the same iteration", helper.partner, waiter.partner)
+	}
+}
+
+// A GO from an epoch that is over is ignored, whatever level it was sent at.
+func TestGoFromAnOverEpochIsIgnored(t *testing.T) {
+	m := &Map{size: 10, robots: 3, turn: 250}
+	helper := &Robot{id: 3, row: 1, col: 1, facing: "N"}
+	inst := instanceAt(0, 250, 1) // level 1: epoch [200, 400)
+	m.turn = 400
+	helper.handle(m, Message{kind: msgGo, from: 1, to: 3, target: inst, val: pair{1, 3}, row: 5, col: 5})
+	if helper.partner != 0 {
+		t.Fatal("helper committed to a GO from a finished epoch")
+	}
+	m.turn = 399
+	helper.handle(m, Message{kind: msgGo, from: 1, to: 3, target: inst, val: pair{1, 3}, row: 5, col: 5})
+	if helper.partner != 1 {
+		t.Fatal("helper ignored a GO from the epoch still running")
 	}
 }

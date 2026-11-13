@@ -268,6 +268,7 @@ func PickupStep(robots []*Robot, targets []*Target, name string) (string, []*Tar
 // ones happen, and finally the robots send their messages. The iteration number
 // is m.turn. It returns a one-line verdict and the targets that remain.
 func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
+	m.robots = len(robots)
 	m.turn++
 
 	// When no targets are left, a new set appears before anyone moves.
@@ -285,7 +286,7 @@ func Tick(m *Map, robots []*Robot, targets []*Target) (string, []*Target) {
 	// sees the result of another robot's action this iteration.
 	chosen := make([]string, len(robots))
 	for i, r := range robots {
-		chosen[i] = r.Decide(r.Sense(m, robots, targets))
+		chosen[i] = r.Decide(m, r.Sense(m, robots, targets))
 	}
 
 	var moves []MoveAction

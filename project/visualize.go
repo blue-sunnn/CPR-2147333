@@ -61,7 +61,7 @@ type Game struct {
 // NewGame returns an empty board; the panel's Apply button fills it.
 func NewGame() *Game {
 	return &Game{
-		m:     &Map{size: N, delay: ExponentialDelay(5)},
+		m:     &Map{size: N, delay: ExponentialDelay(3)},
 		rv:    map[*Robot]*view{},
 		tv:    map[*Target]*view{},
 		panel: NewPanel(),

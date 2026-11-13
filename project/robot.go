@@ -22,12 +22,6 @@ const (
 	Right   = 1
 )
 
-const (
-	weightForward = 65
-	weightLeft    = 20
-	weightRight   = 15
-)
-
 // Robot is one robot on the grid. IDs are unique and start at 1.
 type Robot struct {
 	id, row, col int
@@ -37,16 +31,27 @@ type Robot struct {
 	onTarget     bool // true if the robot is currently on a target
 
 	// Communication (comms.go).
-	inbox  []delivery
-	outbox []Message
+	inbox     []delivery
+	meanDelay float64 // running average of the delay of the packets received; 0 = none yet
+	outbox    []Message
 
-	// Waiter: request number, first/last call and first claim turns, partner,
-	// and the claims received (helper ID -> distance).
-	seq, waitingSince, helpAt, claimedAt, partner int
-	claims                                        map[int]int
+	// Paxos state every robot keeps as acceptor and learner (comms.go), by instance.
+	acc     map[int]*acceptor     // what it promised and accepted
+	decided map[int]pair          // the chosen pair
+	tally   map[vote]map[int]bool // senders of ACCEPTED seen, per proposal
 
-	// Helper: the request it claimed or was accepted for.
-	offer offer
+	// Job: the target it works on and its partner.
+	jobTarget, partner, goalRow, goalCol int  // jobTarget is the Paxos instance
+	targetID, waitingSince               int  // targetID is the plain target ID
+	sweepStage                           int  // sweep: 0 straight, 1 step into the next row, 2 turn back
+	sweepLeft                            bool // sweep: which way the next U-turn goes
+	acked, ready, ackSent                bool // handshake progress, see comms.go
+	reservedFor, reservedUntil           int  // helper: held free for this instance until this turn
+
+	// Proposer: one round at a time, while waiting.
+	counter, propN, propAt int
+	promises               map[int]Message // PROMISE received, by sender
+	accSent                bool            // ACCEPT already sent for propN
 }
 
 // PreMove returns the cell a forward move would enter, without moving.
@@ -87,6 +92,7 @@ type Sensing struct {
 	turn        int // the current iteration
 	wallAhead   bool
 	targetAhead bool  // a target is in the cell in front
+	targetID    int   // the target ahead's ID, valid if targetAhead
 	robotsAhead []int // IDs of the robots in the cell in front, lowest first
 	robotsHere  []int // IDs of the other robots in the robot's own cell, lowest first
 }
@@ -101,6 +107,7 @@ func (r *Robot) Sense(m *Map, robots []*Robot, targets []*Target) Sensing {
 	for _, t := range targets {
 		if t.row == frontRow && t.col == frontCol {
 			s.targetAhead = true
+			s.targetID = t.id
 		}
 	}
 	for _, o := range robots {
@@ -126,47 +133,61 @@ const (
 	actionStay   = "STAY"
 )
 
-// Decide picks this iteration's action: waiters wait, accepted helpers walk to
-// their waiter (comms.go), everyone else wanders at random.
-func (r *Robot) Decide(s Sensing) string {
+// Decide picks this iteration's action: waiters run Paxos (comms.go), helpers walk
+// to their waiter, everyone else sweeps the grid.
+func (r *Robot) Decide(m *Map, s Sensing) string {
 	n := rand.IntN(100)
 
 	switch {
 	case r.onTarget:
-		return r.decideWaiting(s)
+		return r.decideWaiting(m, s)
 
-	case r.offer.accepted:
-		return r.decideHelping(s)
+	case r.partner != 0:
+		return r.decideHelping(m, s)
 
-	case s.targetAhead && (len(s.robotsAhead) > 0 || r.offer.owner != 0):
-		// Target taken, or a claim still unanswered: turn away.
+	case s.targetAhead && (len(s.robotsAhead) > 0 || r.decidedNow(s.targetID, s.turn) || r.reserved(s.turn)):
+		// Target taken or reserved for a helper: turn away.
 		if n < 50 {
 			return actionLeft
 		}
 		return actionRight
 
 	case s.targetAhead:
-		r.startWaiting()
-		return actionMove
-
-	case s.wallAhead:
-		if n < 80 {
-			return actionLeft
-		} else {
-			return actionRight
-		}
-
-	case r.history[1] != Forward && r.history[1] == r.history[2] && r.history[2] == r.history[3]:
+		r.startWaiting(s)
 		return actionMove
 
 	default:
-		switch {
-		case n < weightForward:
-			return actionMove
-		case n < weightForward+weightLeft:
-			return actionLeft
-		default:
-			return actionRight
-		}
+		return r.sweep(m, s)
 	}
+}
+
+// sweep covers the grid row by row: straight on, and at a wall step into the next
+// row and turn back, alternating sides (and flipping when that side is off the grid).
+func (r *Robot) sweep(m *Map, s Sensing) string {
+	turn := func() string {
+		if r.sweepLeft {
+			return actionLeft
+		}
+		return actionRight
+	}
+	switch {
+	case r.sweepStage == 1 && !s.wallAhead: // stage 1 can be stale if a target or job interrupted the sweep
+		r.sweepStage = 2
+		return actionMove
+	case r.sweepStage == 2:
+		t := turn()
+		r.sweepStage, r.sweepLeft = 0, !r.sweepLeft
+		return t
+	case !s.wallAhead:
+		return actionMove
+	}
+	side := rightOf[r.facing]
+	if r.sweepLeft {
+		side = leftOf[r.facing]
+	}
+	if d := deltas[side]; !m.IsInBounds(r.row+d[0], r.col+d[1]) {
+		r.sweepLeft = !r.sweepLeft
+	}
+	r.sweepStage = 1
+	return turn()
 }

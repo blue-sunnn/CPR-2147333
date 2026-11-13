@@ -15,6 +15,8 @@ type Map struct {
 	respawn, nextTarget int // targets added when none are left (0 = never); next new ID
 
 	delay func() int // extra iterations per message per receiver; nil = none
+
+	robots int // number of robots, used for the quorum
 }
 
 // ExponentialDelay returns a delay func drawing from an exponential
@@ -29,9 +31,12 @@ func (m *Map) messageDelay() int {
 	if m.delay == nil {
 		return 0
 	}
-	return m.delay()
+	return max(0, m.delay()) // a negative draw counts as no delay
 }
 
 func (m *Map) IsInBounds(row, col int) bool {
 	return row >= 0 && row < m.size && col >= 0 && col < m.size
 }
+
+// quorum is a majority of the robots.
+func (m *Map) quorum() int { return m.robots/2 + 1 }
