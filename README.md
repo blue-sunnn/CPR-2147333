@@ -124,9 +124,20 @@ targets); a tick with no events is just the header.
 When no run is going, the keyboard steps every robot by hand: Space moves,
 Left / Right turn, P picks up.
 
-Robots wander at random until one steps onto a target. It broadcasts a help
-request, the closest free robot answers and walks over, and the two pick up
-together (`comms.go`). When all targets are gone, a new set appears.
+Robots wander at random until one steps onto a target. That robot (the waiter)
+runs a Paxos round to agree on a helper: PREPARE/PROMISE, then ACCEPT/ACCEPTED,
+proposing the pair (waiter, helper) with the closest free robot as helper. GO,
+ACK and READY then make the pickup synchronous: the helper walks over and steps
+into the cell only after the waiter answers READY, so both pick up together
+(`comms.go`). When all targets are gone, a new set appears.
+
+Messages are delayed per receiver with an exponential distribution (the window
+uses a mean of 20 iterations, `ExponentialDelay` in `map.go`). The protocol
+adapts to the network: each robot keeps a running average of how late the
+packets it receives are and stretches its timeouts (resend, give up, offer help,
+reserve) and the length of the Paxos epoch when the average is above the delay
+the constants were sized for. A pair that is not finished by the end of its
+epoch is dropped, so a lost pair never blocks a target for ever.
 
 ## How the code is organized
 
@@ -138,11 +149,12 @@ without imports.
 | `main.go` | Opens the window. The board starts empty; Apply in the panel places robots and targets at random. |
 | `simulation.go` | The rules. `Tick` is one iteration: every robot senses and decides, the actions are checked, and only the legal ones are applied. Also checks the starting layout and makes random ones. |
 | `robot.go` | The robot: position, facing, which turn it arrived. `Sense` is what it sees and `Decide` picks its action (random for now, the real rules go here). |
-| `comms.go` | Robot messages (input/output queues, optional delay) and the help/claim/accept protocol. |
+| `comms.go` | Robot messages (input/output queues, per-receiver delay) and the Paxos partner search with delay-adaptive timeouts. |
 | `target.go`, `map.go` | The target and the grid. |
 | `visualize.go` | The window state, the log (printed to the terminal), the settings panel (number fields and Apply) and the keyboard stepper for when no run is going. The picture glides toward the simulation state a little every frame, so the simulation itself can jump instantly. |
 | `draw.go` | All drawing: the board, robots, stars, text, colors and sizes. |
-| `simulation_test.go` | Tests for the rules, random placement, `Sense` and `Tick`. |
+| `simulation_test.go` | Tests for the rules, random placement, `Sense`, `Tick` and the Paxos protocol under delay. |
+| `experiments_test.go` | Experiments for Milestone 3 (delay).  |
 | `go.mod`, `go.sum` | The Go dependencies and their checksums. |
 
 `simulation.go` does not use the window, so the rules can be tested and reused
